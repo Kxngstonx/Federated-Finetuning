@@ -1,5 +1,7 @@
 # Federated Fine-Tuning Blueprint with Flower
 
+> Forked from [mozilla-ai/federated-finetuning](https://github.com/mozilla-ai/federated-finetuning) (Apache License 2.0). This fork adds custom federated LoRA strategies (fedit, fedora, fedrot, fedsvd, ffalora, flora) on top of the original blueprint.
+
 [![](https://dcbadge.limes.pink/api/server/YuMNeuKStr?style=flat)](https://discord.gg/YuMNeuKStr)
 
 Large language models (LLMs), which have been trained on vast amounts of publicly accessible data, are great.
