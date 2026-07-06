@@ -20,14 +20,15 @@ def load_config(toml_path="pyproject.toml"):
     model_name = app_config["model"]["name"]
     dataset_name = app_config["dataset"]["name"]
     num_rounds = app_config["num-server-rounds"]
+    use_dora = app_config["model"].get("use-dora", False)
     num_clients = config["tool"]["flwr"]["federations"]["local-simulation"]["options"][
         "num-supernodes"
     ]
-    return model_name, dataset_name, num_clients, num_rounds
+    return model_name, dataset_name, num_clients, num_rounds, use_dora
 
 
 # Read model, dataset name, and number of clients
-MODEL_NAME, DATASET_NAME, NUM_CLIENTS, NUM_ROUNDS = load_config()
+MODEL_NAME, DATASET_NAME, NUM_CLIENTS, NUM_ROUNDS, USE_DORA = load_config()
 
 # Create output directory with timestamp
 current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -77,6 +78,7 @@ peft_config = LoraConfig(
     lora_dropout=0.075,
     task_type="CAUSAL_LM",
     target_modules=["q_proj", "v_proj"],
+    use_dora=USE_DORA,
 )
 model = get_peft_model(base_model, peft_config)
 

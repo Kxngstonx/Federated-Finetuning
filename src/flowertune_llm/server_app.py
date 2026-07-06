@@ -6,11 +6,11 @@ from datetime import datetime
 from flwr.common import Context, ndarrays_to_parameters
 from flwr.common.config import unflatten_dict
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
-from flwr.server.strategy import FedAvg
 from omegaconf import DictConfig
 
 from flowertune_llm.models import get_model, get_parameters, set_parameters
 from flowertune_llm.dataset import replace_keys
+from flowertune_llm.strategies import build_strategy
 
 
 # Get function that will be executed by the strategy's evaluate() method
@@ -75,7 +75,7 @@ def server_fn(context: Context):
     init_model_parameters = ndarrays_to_parameters(init_model_parameters)
 
     # Define strategy
-    strategy = FedAvg(
+    strategy_kwargs = dict(
         fraction_fit=cfg.strategy.fraction_fit,
         fraction_evaluate=cfg.strategy.fraction_evaluate,
         on_fit_config_fn=get_on_fit_config(save_path),
@@ -84,6 +84,10 @@ def server_fn(context: Context):
         evaluate_fn=get_evaluate_fn(
             cfg.model, cfg.train.save_every_round, num_rounds, save_path
         ),
+    )
+    aggregation = cfg.strategy.get("aggregation", "fedora")
+    strategy = build_strategy(
+        aggregation, model=init_model, cfg=cfg.strategy.get(aggregation, {}), **strategy_kwargs
     )
     config = ServerConfig(num_rounds=num_rounds)
 

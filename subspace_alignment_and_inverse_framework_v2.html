@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>연합학습 기반 DoRA의 부분공간 정렬 및 글로벌 가중치 역산 프레임워크 (V2)</title>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true
+            },
+            options: {
+                ignoreHtmlClass: 'tex2jax_ignore',
+                processHtmlClass: 'tex2jax_process'
+            }
+        };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #fafbfd; color: #2c3e50; line-height: 1.7; margin: 0; padding: 40px; }
+        .wrapper { max-width: 1000px; margin: 0 auto; background: #ffffff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #eef2f5; }
+        h1 { font-size: 24px; color: #1a252f; border-bottom: 2px solid #34495e; padding-bottom: 12px; margin-top: 0; }
+        h2 { font-size: 18px; color: #2c3e50; margin-top: 35px; border-left: 4px solid #3498db; padding-left: 12px; }
+        h3 { font-size: 15px; color: #34495e; margin-top: 20px; font-weight: 600; }
+        p, li { font-size: 14.5px; color: #4b5563; text-align: justify; }
+        ul, ol { padding-left: 20px; }
+        .math-block { background-color: #f8fafc; border: 1px solid #e2e8f0; padding: 18px; border-radius: 6px; overflow-x: auto; margin: 15px 0; font-family: 'Times New Roman', Times, serif; }
+        .highlight-box { background-color: #f0f7ff; border-left: 4px solid #0066cc; padding: 20px; margin: 25px 0; border-radius: 0 6px 6px 0; }
+        .matrix-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        .matrix-table th, .matrix-table td { border: 1px solid #e2e8f0; padding: 10px; font-size: 13.5px; text-align: left; }
+        .matrix-table th { background-color: #f1f5f9; color: #1a252f; font-weight: 600; }
+    </style>
+</head>
+<body>
+
+<div class="wrapper">
+    <h1>SVD 기반 부분공간 정렬(Subspace Alignment) 및 글로벌 가중치 역산 알고리즘</h1>
+    <p>본 문서는 연합학습 환경에서 DoRA(Weight-Decomposed Low-Rank Adaptation) 가중치 통합 시 발생하는 랭크 폭발 및 비선형 순환 참조 문제를 해결하기 위한 수학적 프레임워크를 다룹니다. 전반부의 공통 기준점 $A_{ref}$ 추출 프로세스부터 후반부의 글로벌 가중치 $B_{new}$ 역산 단계까지 순차적으로 기술합니다.</p>
+
+    <h2>1. 결합 행렬 구성 및 SVD를 통한 최적 공통 기준점 ($A_{ref}$) 추출</h2>
+    <p>각 클라이언트 $k \in \{1, \dots, K\}$ 가 각자의 로컬 데이터로 최적화하여 반환한 랭크 $r$의 로컬 방향 행렬을 $A_k \in \mathbb{R}^{r \times d_{in}}$ 이라 정의합니다. 입력 차원 $d_{in}$은 전역적으로 동일합니다.</p>
+    
+    <h3>1.1 수직 결합 행렬 (Vertical Concatenation)</h3>
+    <p>서버는 수집된 $K$개의 로컬 방향 행렬들을 행 방향(세로)으로 누적하여 거대 결합 행렬 $A_{stack}$을 생성합니다.</p>
+    <div class="math-block">
+        $$A_{stack} = \begin{bmatrix} A_1 \\ A_2 \\ \vdots \\ A_K \end{bmatrix} \in \mathbb{R}^{Kr \times d_{in}}$$
+    </div>
+
+    <h3>1.2 특잇값 분해(SVD) 및 에카르트-영-미르스키 정리의 적용</h3>
+    <p>결합 행렬 $A_{stack}$에 대해 특잇값 분해를 수행하여 정규 직교 기저들을 도출합니다.</p>
+    <div class="math-block">
+        $$A_{stack} = U \Sigma V^T$$
+    </div>
+    <p>에카르트-영-미르스키(Eckart-Young-Mirsky) 정리에 따라, $A_{stack}$에 대해 최소 제곱 오차를 만족하는 최적의 랭크 $r$ 근사 행렬은 상위 $r$개의 주성분 성분($U_r \Sigma_r V_r^T$)으로 제한됩니다. 우리의 목적은 입력 데이터 차원 $d_{in}$에 대응하는 최적의 정규 직교 기저 공간을 선언하는 것이므로, 정의역(Domain) 공간의 기저를 형성하는 우측 특이 벡터 행렬(Right Singular Vectors) $V^T$의 상위 $r$개 행(Rows)만을 추출하여 전역 공통 기준점 $A_{ref}$로 확정합니다.</p>
+    <div class="math-block">
+        $$A_{ref} = V_r^T \in \mathbb{R}^{r \times d_{in}}$$
+    </div>
+
+    <table class="matrix-table">
+        <thead>
+            <tr>
+                <th>성분 행렬</th>
+                <th>행렬 차원 (Dimension)</th>
+                <th>물리적 의미 및 선택/배제 사유</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>좌측 특이 벡터 ($U$)</strong></td>
+                <td>$\mathbb{R}^{Kr \times Kr}$</td>
+                <td>클라이언트 간의 선형 결합 계수 공간입니다. 입력 차원 $d_{in}$과 무관하므로 $A_{ref}$ 규격과 불일치하여 배제합니다.</td>
+            </tr>
+            <tr>
+                <td><strong>우측 특이 벡터 ($V^T$)</strong></td>
+                <td>$\mathbb{R}^{d_{in} \times d_{in}}$</td>
+                <td>입력 특징 공간(Row Space)의 정규 직교 기저입니다. 상위 $r$개 절단 시 클라이언트 모델의 $A$ 규격($r \times d_{in}$)과 완벽히 일치하므로 $A_{ref}$로 채택합니다.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>2. Procrustes 정렬 및 가중치 보상 연산</h2>
+    <p>각 클라이언트의 독립적인 로컬 지식은 고유 부분공간 $\Delta W_k = B_k A_k$ 내에 보존되어 있습니다. 이를 파괴하지 않고 $A_{ref}$ 공간으로 정렬하기 위해 직교 프로크루스테스(Orthogonal Procrustes) 문제를 풀어 회전 행렬 $R_k$를 도출합니다.</p>
+    <div class="math-block">
+        $$R_k = \arg\min_{R^T R = I} \|R A_k - A_{ref}\|_F^2$$
+    </div>
+    <p>직교 행렬의 성질($R_k^T R_k = I$)에 기인한 항등원 삽입 트릭을 활용하여, $A_k$가 회전한 변위만큼 $B_k$ 측에 역방향 보상 회전을 부여합니다.</p>
+    <div class="math-block">
+        $$B_k A_k = B_k (R_k^T R_k) A_k = (B_k R_k^T) (R_k A_k) \approx B'_k A_{ref}$$
+    </div>
+    <div class="math-block">
+        $$\text{where } B'_k = B_k R_k^T, \;\; R_k A_k \approx A_{ref}$$
+    </div>
+    <p>이 전처리를 통해 모든 클라이언트의 업데이트 수식 오른쪽에 공통 분모 $A_{ref}$가 확보되므로, 단순 산술 합산 시 발생하는 랭크 폭발 현상이 원천 제어됩니다.</p>
+
+    <h2>3. Cyclic Dependency 해결 후 글로벌 가중치 역산 프로세스</h2>
+    <p>상기 단계를 통해 랭크가 $r$ 이하로 통제된 $\Delta W_{avg}$가 구축되면, 정규화 분모 항의 비선형 순환 참조(Cyclic Dependency)를 해결하기 위한 Alternating Optimization 최적화 루프가 가동됩니다. 루프가 최종 수렴하여 최적의 크기 벡터 $\Lambda^*$가 확정된 이후, 고정된 $A_{ref}$ 하에서 최종 글로벌 가중치 행렬 $B_{new}$를 산출하는 내부 단계는 다음과 같습니다.</p>
+
+    <h3>Step 3.1: 목표 잔차 행렬(Target Residual Matrix) $M$의 확정</h3>
+    <p>서버는 수렴된 전역 크기 가중치 $\Lambda^*$를 적용하여 최종 타겟 가중치 $W_{global}$을 연산하고, 여기에서 사전학습 가중치 $W_0$를 차감하여 오직 저랭크 하위 네트워크($B \cdot A$)가 흡수해야 할 목표 잔차 행렬 $M$을 확정합니다.</p>
+    <div class="math-block">
+        $$M = W_{global} - W_0 = \left( \frac{W_0 + \Delta W_{avg}}{\|W_0 + \Delta W_{avg}\|_c} \odot \Lambda^* \right) - W_0 \in \mathbb{R}^{d_{out} \times d_{in}}$$
+    </div>
+
+    <h3>Step 3.2: 목적 함수(Objective Function) 정의</h3>
+    <p>$A_{ref}$가 고정 상수로 주어졌으므로, 최적화 문제는 $B$에 대한 단순 선형 최소 제곱법(Linear Least Squares) 문제로 환원됩니다.</p>
+    <div class="math-block">
+        $$\min_{B} \mathcal{L}(B) = \min_{B} \| M - B A_{ref} \|_F^2$$
+    </div>
+
+    <h3>Step 3.3: 정규 직교성을 활용한 해석적 해(Closed-form Solution) 도출</h3>
+    <p>오차를 최소화하는 해를 구하기 위해 목적 함수를 $B$에 대해 미분하여 $0$이 되는 극점을 탐색합니다. 일반적인 해법은 무어-펜로즈 유사 역행렬($A_{ref}^\dagger$)을 요구합니다.</p>
+    <div class="math-block">
+        $$B_{new} = M A_{ref}^\dagger = M A_{ref}^T (A_{ref} A_{ref}^T)^{-1}$$
+    </div>
+    <p>여기서 $A_{ref}$는 앞선 1단계에서 SVD의 우측 특이 벡터($V_r^T$)로부터 기인했으므로, <strong>행 벡터 간 정규 직교성(Orthonormality)</strong>이 완벽히 보장됩니다. 이에 따라 아래의 성질이 성립합니다.</p>
+    <div class="math-block">
+        $$A_{ref} A_{ref}^T = I_{r \times r}$$
+    </div>
+    <p>항등 행렬 변환에 의해 복잡한 역행렬 연산 항이 완전히 소거되며, $B_{new}$의 최종 해는 연산 효율성이 극대화된 행렬 곱 형태로 변환됩니다.</p>
+    <div class="math-block">
+        $$B_{new} = M A_{ref}^T$$
+    </div>
+
+    <div class="highlight-box">
+        <strong>💡 핵심 연산적 이점 및 복잡도 분석:</strong><br>
+        $A_{ref}$가 정렬을 통해 정규 직교 고정 상수로 취급되므로, Alternating Optimization 스텝 내에서 $B$를 풀 때 추가적인 SVD 연산이나 복잡한 역행렬 연산이 전면 배제됩니다. 
+        최종 연산 복잡도는 고차원 SVD 분해의 $\mathcal{O}(d_{out} d_{in} \min(d_{out}, d_{in}))$ 대신, 단순 행렬 곱 연산인 <strong>$\mathcal{O}(d_{out} \cdot d_{in} \cdot r)$</strong> 수준으로 하강합니다. 이는 다수의 클라이언트와 대규모 차원을 다루는 연합학습 서버의 확장성 병목을 완벽하게 해소합니다.
+    </div>
+</div>
+
+</body>
+</html>

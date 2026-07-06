@@ -1,19 +1,6 @@
-<p align="center">
-  <picture>
-    <!-- When the user prefers dark mode, show the white logo -->
-    <source media="(prefers-color-scheme: dark)" srcset="./images/Blueprint-logo-white.png">
-    <!-- When the user prefers light mode, show the black logo -->
-    <source media="(prefers-color-scheme: light)" srcset="./images/Blueprint-logo-black.png">
-    <!-- Fallback: default to the black logo -->
-    <img src="./images/Blueprint-logo-black.png" width="35%" alt="Project logo"/>
-  </picture>
-</p>
-
 # Federated Fine-Tuning Blueprint with Flower
 
 [![](https://dcbadge.limes.pink/api/server/YuMNeuKStr?style=flat)](https://discord.gg/YuMNeuKStr)
-[![Tests](https://github.com/mozilla-ai/speech-to-text-finetune/actions/workflows/tests.yaml/badge.svg)](https://github.com/mozilla-ai/speech-to-text-finetune/actions/workflows/tests.yaml/)
-[![Ruff](https://github.com/mozilla-ai/speech-to-text-finetune/actions/workflows/lint.yaml/badge.svg?label=Ruff)](https://github.com/mozilla-ai/speech-to-text-finetune/actions/workflows/lint.yaml/)
 
 Large language models (LLMs), which have been trained on vast amounts of publicly accessible data, are great.
 
@@ -22,10 +9,6 @@ However, the availability of high-quality public data is decreasing. Federated A
 This blueprint demonstrates **Federated Fine-Tuning of LLMs** using [Flower](https://flower.ai), a framework for federated learning. We fine-tune **Qwen2-0.5B-Instruct model** on the **Alpaca-GPT4 dataset** using **PEFT-based LoRA adapters**.
 
 📘 To explore this project further and discover other Blueprints, visit the [**Blueprints Hub**](https://developer-hub.mozilla.ai/).
-
-<p align="center">
-  <img src="./images/flower_visual.png" alt="Flower" width="600">
-</p>
 
 ---
 
@@ -82,8 +65,6 @@ Follow this [how-to guide](https://flower.ai/docs/framework/how-to-run-flower-wi
 
 If you are already familiar with how the Deployment Engine works, you may want to learn how to run it using Docker. Check out the [Flower with Docker](https://flower.ai/docs/framework/docker/index.html) documentation.
 
-![](./images/data_global.png)
-
 ### Test Your Fine-Tuned Model
 
 To generate text responses from your trained model:
@@ -123,10 +104,6 @@ After training, the fine-tuned model is stored in `results/` for later evaluatio
 
 We also provide `./demo/run.sh` that runs federated fine-tuning with default settings, and thereafter local fine-tuning. It will then test both fine-tuned models on benchmark data.
 
-## Expected results
-
-![](./images/accuracy_plot_all_datasets.png)
-
 ## Device Resources
 
 You can adjust the CPU/GPU resources you assign to each of the clients based on your device.
@@ -163,6 +140,30 @@ federated-finetuning-blueprint
 ├── pyproject.toml  # Project metadata and dependencies
 ```
 
+## 🎨 Customization
+
+This Blueprint is designed to be flexible and easily adaptable to your specific needs.
+
+### Changing the Model
+
+To swap out the default model for a different one, update the model name in `pyproject.toml` as long as it is a model from HuggingFace.
+
+```bash
+model.name = "<YOUR_CUSTOM_MODEL>"
+```
+
+Ensure that the new model supports the same fine-tuning methods as the original.
+
+### Modifying the Streamlit App
+
+Make your own application of a federated fine-tuned model and launch it in an application in the browser. Add graphics, new ways of prompting the model, and more.
+
+### Other Customization Ideas
+
+- Adjust **training parameters** in `pyproject.toml`, such as batch size, number of rounds, and learning rate.
+- Modify **dataset preprocessing** in `src/flowertune_llm/dataset.py` to support different data formats.
+- Implement **custom evaluation metrics** in `src/benchmarks/eval.py` to better assess performance based on your specific requirements.
+
 ## ❓ Troubleshooting
 ### Installation Issues:
 Ensure dependencies are installed:
@@ -181,9 +182,4 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## 📜 License
 
-This project is licensed under the Apache 2.0 License. See the LICENSE file for details.
-
-🤝 Contributing
-
-Contributions are welcome!
-To get started, check out the CONTRIBUTING.md file.
+This project is licensed under the Apache 2.0 License.

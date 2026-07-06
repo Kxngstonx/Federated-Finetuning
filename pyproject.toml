@@ -21,7 +21,7 @@ dependencies = [
   "trl==0.8.1",
   "bitsandbytes==0.45.0",
   "scipy==1.13.0",
-  "peft==0.6.2",
+  "peft==0.13.2",
   "fschat[model_worker,webui]==0.2.35",
   "transformers==4.48.0",
   "sentencepiece==0.2.0",
@@ -77,6 +77,7 @@ model.quantization = 4
 model.gradient-checkpointing = true
 model.lora.peft-lora-r = 32
 model.lora.peft-lora-alpha = 64
+model.use-dora = true
 train.save-every-round = 5
 train.learning-rate-max = 5e-5
 train.learning-rate-min = 1e-6
@@ -92,8 +93,14 @@ train.training-arguments.save-steps = 1000
 train.training-arguments.save-total-limit = 10
 train.training-arguments.gradient-checkpointing = true
 train.training-arguments.lr-scheduler-type = "constant"
+strategy.aggregation = "fedora"
 strategy.fraction-fit = 0.1
 strategy.fraction-evaluate = 0.0
+strategy.fedsvd.recalculate-svd-period = 5
+strategy.fedsvd.svd-warmup-steps = 0
+strategy.flora.merge-into-base = true
+strategy.fedrot.rotate = true
+strategy.fedrot.initial-share = "A"
 num-server-rounds = 100
 
 [tool.flwr.federations]
