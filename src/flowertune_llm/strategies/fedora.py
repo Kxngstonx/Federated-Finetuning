@@ -17,9 +17,9 @@ from flwr.common import (
 from flwr.common.logger import log
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
-from flwr.server.strategy.aggregate import aggregate
 
 from flowertune_llm.strategies.common import _LoraLayerRef, build_layer_refs
+from fedbench_common.subspace_metrics import mean_subspace_overlap
 
 _EPS = 1e-8
 
@@ -32,26 +32,13 @@ def aggregate_dora_layer(
     b_list: List[torch.Tensor],  # each (out_features, r) float32
     m_list: Optional[List[torch.Tensor]],  # each (out_features,) float32, or None
     freqs: List[float],  # per-client weight, sums to 1.0
-    num_examples: List[int],  # raw counts, used only by the fallback path
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Pure-tensor implementation of the 5-step DoRA-aware layer aggregation. All
-    inputs/outputs are float32 CPU tensors; numpy/dtype conversion happens in the caller."""
-    out_features, in_features = W0.shape
-    is_dora_layer = m_list is not None
+    """Pure-tensor implementation of the 4-step DoRA-aware layer aggregation. All
+    inputs/outputs are float32 CPU tensors; numpy/dtype conversion happens in the caller.
 
-    if min(out_features, in_features) < r:
-        # Rank-deficient layer (e.g. a tiny head) -- SVD to rank r is impossible.
-        # Fall back to a plain weighted average of the raw A/B/(m) arrays.
-        per_client = []
-        for i, n in enumerate(num_examples):
-            vals: NDArrays = [a_list[i].numpy(), b_list[i].numpy()]
-            if is_dora_layer:
-                vals.append(m_list[i].numpy())
-            per_client.append((vals, n))
-        avg = aggregate(per_client)
-        a_new, b_new = torch.from_numpy(avg[0]), torch.from_numpy(avg[1])
-        m_new = torch.from_numpy(avg[2]) if is_dora_layer else None
-        return a_new, b_new, m_new
+    Requires target modules whose out/in dimensions are >= r -- callers must keep
+    `target_modules` restricted accordingly (e.g. via pyproject.toml)."""
+    is_dora_layer = m_list is not None
 
     # --- Step 1: reconstruct each client's effective weight, FedAvg them ---
     w_global = torch.zeros_like(W0)
@@ -92,7 +79,9 @@ class FeDoRA(FedAvg):
     squares for B, and the aggregated weight's own row norms for the new magnitude m.
 
     Requires every target module to have been built with use_dora=True; raises ValueError at
-    construction time otherwise.
+    construction time otherwise. Also requires target modules whose out/in dimensions are
+    >= r -- there is no rank-deficiency fallback; keep `target_modules` restricted accordingly
+    (e.g. via pyproject.toml) instead.
     """
 
     def __init__(self, *, model, cfg=None, **kwargs) -> None:
@@ -126,12 +115,14 @@ class FeDoRA(FedAvg):
         num_examples: List[int] = [fit_res.num_examples for _, fit_res in results]
 
         aggregated: NDArrays = [None] * len(client_arrays[0])
+        layer_overlaps: List[float] = []
         for layer in self._layers:
-            a_new, b_new, m_new = self._aggregate_layer(layer, client_arrays, num_examples)
+            a_new, b_new, m_new, overlap = self._aggregate_layer(layer, client_arrays, num_examples)
             aggregated[layer.idx_a] = a_new
             aggregated[layer.idx_b] = b_new
             if layer.idx_m is not None:
                 aggregated[layer.idx_m] = m_new
+            layer_overlaps.append(overlap)
 
         parameters_aggregated = ndarrays_to_parameters(aggregated)
 
@@ -142,6 +133,12 @@ class FeDoRA(FedAvg):
         elif server_round == 1:
             log(WARNING, "No fit_metrics_aggregation_fn provided")
 
+        # Requirement: basis overlap / cosine similarity, FeDoRA v1 -- each client's raw
+        # (unrotated) local A_i vs the SVD-derived shared reference A_new computed in
+        # aggregate_dora_layer's step 2 (there is no explicit per-client rotation in v1).
+        if layer_overlaps:
+            metrics_aggregated["fedora_v1_basis_overlap_mean"] = float(np.mean(layer_overlaps))
+
         return parameters_aggregated, metrics_aggregated
 
     def _aggregate_layer(
@@ -149,7 +146,7 @@ class FeDoRA(FedAvg):
         layer: _LoraLayerRef,
         client_arrays: List[NDArrays],
         num_examples: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float]:
         total = sum(num_examples)
         freqs = [n / total for n in num_examples]
 
@@ -166,9 +163,10 @@ class FeDoRA(FedAvg):
         )
 
         a_new, b_new, m_new = aggregate_dora_layer(
-            layer.W0, layer.scaling, layer.r, a_list, b_list, m_list, freqs, num_examples,
+            layer.W0, layer.scaling, layer.r, a_list, b_list, m_list, freqs,
         )
+        overlap = float(np.mean([mean_subspace_overlap(a_c, a_new) for a_c in a_list]))
         a_out = a_new.numpy().astype(dtype_a, copy=False)
         b_out = b_new.numpy().astype(dtype_b, copy=False)
         m_out = m_new.numpy().astype(dtype_m, copy=False) if m_new is not None else None
-        return a_out, b_out, m_out
+        return a_out, b_out, m_out, overlap

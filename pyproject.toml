@@ -15,6 +15,10 @@ dependencies = [
   "loguru",
   "streamlit",
   "flwr[simulation]==1.15.0",
+  # flwr's CLI (typer==0.12.5, pulled in by flwr[simulation]) crashes at import time
+  # ("TypeError: Secondary flag is not valid for non-boolean flag") against click>=8.2 --
+  # pin explicitly since flwr itself doesn't constrain click tightly enough to prevent this.
+  "click<8.2",
   "flwr-datasets>=0.5.0",
   "torch==2.3.1",
   "scikit-learn==1.5.2",

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=48", "hatchling"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glue-nlu"
+version = "1.0.0"
+description = "GLUE / RoBERTa-Large NLU federated fine-tuning pipeline, ported from FedRot-LoRA/federatedscope/glue"
+requires-python = ">=3.10"
+dependencies = [
+  "flwr[simulation]==1.15.0",
+  "flwr-datasets>=0.5.0",
+  "torch==2.3.1",
+  "scikit-learn==1.5.2",
+  "peft==0.13.2",
+  "transformers==4.48.0",
+  "omegaconf==2.3.0",
+  "datasets",
+]
+# NOTE: this app reuses flowertune_llm.strategies / flowertune_llm.peft_layers (task-agnostic
+# LoRA aggregation strategies + layer indexing) and fedbench_common (instrumentation,
+# partitioners) unchanged, from the root package. Not declared as a formal dependency here since
+# pip doesn't support relative `file://../../` URIs -- instead, install the root package first
+# (`pip install -e .` from the repo root) into the same venv this app is installed into; both
+# apps and the root package are expected to share one environment, not isolated ones.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "src.glue_nlu.server_app:app"
+clientapp = "src.glue_nlu.client_app:app"
+
+[tool.flwr.app.config]
+# Task selection -- one of sst2/qnli/mnli/qqp/rte. MNLI always evaluated matched-only.
+dataset.task-name = "sst2"
+dataset.dirichlet-alpha = 0.5
+model.name = "FacebookAI/roberta-large"
+model.lora.peft-lora-r = 4
+model.lora.peft-lora-alpha = 8
+model.lora.peft-lora-dropout = 0.05
+model.use-dora = true
+train.seq-length = 128
+train.learning-rate-max = 2e-2
+train.learning-rate-min = 0.0
+train.local-update-steps = 20
+# Adapter checkpoints (model.save_pretrained) are written every save-every-round rounds (+ always
+# at the final round), decoupled from the per-round accuracy eval below -- keeps the per-round
+# learning curve intact while avoiding 250 checkpoint dirs per run across the full sweep.
+train.save-every-round = 25
+train.training-arguments.output-dir = ""
+train.training-arguments.learning-rate = ""
+train.training-arguments.per-device-train-batch-size = 128
+train.training-arguments.gradient-accumulation-steps = 1
+train.training-arguments.logging-steps = 10
+train.training-arguments.max-steps = 20
+train.training-arguments.save-strategy = "no"
+train.training-arguments.lr-scheduler-type = "constant"
+strategy.aggregation = "fedrot"
+strategy.fraction-fit = 1.0
+strategy.fraction-evaluate = 0.0
+strategy.fedsvd.recalculate-svd-period = 5
+strategy.fedsvd.svd-warmup-steps = 0
+strategy.flora.merge-into-base = true
+strategy.fedrot.rotate = true
+strategy.fedrot.initial-share = "A"
+federate.client-num = 3
+num-server-rounds = 250
+seed = 13
+eval.freq = 1
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 3
+options.backend.client-resources.num-cpus = 4
+options.backend.client-resources.num-gpus = 1.0

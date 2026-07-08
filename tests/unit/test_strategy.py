@@ -119,7 +119,7 @@ def test_aggregate_dora_layer_math():
     freqs = [n / total for n in num_examples]
 
     a_new, b_new, m_new = aggregate_dora_layer(
-        w0, scaling, r, a_list, b_list, m_list, freqs, num_examples,
+        w0, scaling, r, a_list, b_list, m_list, freqs,
     )
 
     assert a_new.shape == (r, in_features)
@@ -141,34 +141,6 @@ def test_aggregate_dora_layer_math():
     residual = m_ref - b_new @ a_new
     normal_eq = a_new @ residual.T
     assert torch.allclose(normal_eq, torch.zeros_like(normal_eq), atol=1e-3)
-
-
-def test_rank_deficient_fallback():
-    torch.manual_seed(2)
-    out_features, in_features, r = 3, 3, 4  # min(out, in) < r -> fallback branch
-    scaling = 2.0
-
-    w0 = torch.randn(out_features, in_features)
-    a_list = [torch.randn(r, in_features) for _ in range(2)]
-    b_list = [torch.randn(out_features, r) for _ in range(2)]
-    m_list = [torch.rand(out_features) + 0.5 for _ in range(2)]
-    num_examples = [4, 6]
-    total = sum(num_examples)
-    freqs = [n / total for n in num_examples]
-
-    a_new, b_new, m_new = aggregate_dora_layer(
-        w0, scaling, r, a_list, b_list, m_list, freqs, num_examples,
-    )
-
-    expected = aggregate(
-        [
-            ([a.numpy(), b.numpy(), m.numpy()], n)
-            for a, b, m, n in zip(a_list, b_list, m_list, num_examples)
-        ]
-    )
-    assert np.allclose(a_new.numpy(), expected[0])
-    assert np.allclose(b_new.numpy(), expected[1])
-    assert np.allclose(m_new.numpy(), expected[2])
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,30 @@ from flwr.server.strategy import FedAvg
 from flwr.server.strategy.aggregate import aggregate
 
 from flowertune_llm.strategies.common import _LoraLayerRef, build_layer_refs
+from fedbench_common.quant_error import quantization_roundtrip_error
+
+
+def _bnb_quant_kwargs(model, layer_name: str) -> "Optional[dict]":
+    """Requirement: quantization round-trip error, FLoRA only. Reads the exact quantization
+    arguments (blocksize/quant_type/compress_statistics/quant_storage) the base layer was
+    originally loaded with, mirroring what models.py::set_parameters reads fresh off the model
+    every round -- cached once here since the model itself isn't retained by FLoRA otherwise.
+    Returns None when the base layer isn't bitsandbytes-quantized (e.g. an unquantized RoBERTa
+    base layer), in which case there is no quantization round-trip to measure."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return None
+    module = model.get_submodule(layer_name)
+    existing = module.base_layer.weight
+    if not isinstance(existing, bnb.nn.Params4bit):
+        return None
+    return {
+        "blocksize": existing.blocksize,
+        "compress_statistics": existing.compress_statistics,
+        "quant_type": existing.quant_type,
+        "quant_storage": existing.quant_storage,
+    }
 
 
 class FLoRA(FedAvg):
@@ -57,6 +81,9 @@ class FLoRA(FedAvg):
         super().__init__(**kwargs)
         self._layers: List[_LoraLayerRef] = build_layer_refs(model)
         self._w0: Dict[str, torch.Tensor] = {layer.name: layer.W0.clone() for layer in self._layers}
+        self._quant_kwargs: Dict[str, Optional[dict]] = {
+            layer.name: _bnb_quant_kwargs(model, layer.name) for layer in self._layers
+        }
 
     def initialize_parameters(self, client_manager):
         params = super().initialize_parameters(client_manager)
@@ -87,6 +114,7 @@ class FLoRA(FedAvg):
 
         aggregated_lora: NDArrays = [None] * len(client_arrays[0])
         extra_w0_arrays: List[np.ndarray] = []
+        quant_errors: List[float] = []
 
         for layer in self._layers:
             a_list = [torch.from_numpy(arr[layer.idx_a].astype(np.float32, copy=False)) for arr in client_arrays]
@@ -97,6 +125,12 @@ class FLoRA(FedAvg):
                 delta_w = delta_w + freq * layer.scaling * (b_c @ a_c)
             # Exact float32 addition -- the master is never derived from a quantized value.
             self._w0[layer.name] = self._w0[layer.name] + delta_w
+
+            # Requirement: quantization round-trip error curve, FLoRA only --
+            # ||Dequant(Quant(W))-W||_F for the master this round, vs round.
+            quant_kwargs = self._quant_kwargs.get(layer.name)
+            if quant_kwargs is not None:
+                quant_errors.append(quantization_roundtrip_error(self._w0[layer.name], quant_kwargs))
 
             out_features, in_features = self._w0[layer.name].shape
             r = layer.r
@@ -124,5 +158,8 @@ class FLoRA(FedAvg):
             metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
         elif server_round == 1:
             log(WARNING, "No fit_metrics_aggregation_fn provided")
+
+        if quant_errors:
+            metrics_aggregated["flora_quant_error_frob"] = float(np.mean(quant_errors))
 
         return parameters_aggregated, metrics_aggregated

@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=48", "hatchling"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-humaneval"
+version = "1.0.0"
+description = "Llama-3-8B federated fine-tuning pipeline: train CodeSearchNet (N=6, non-IID by language), eval HumanEval pass@1. GSM8K is a separate experiment, see apps/llm-gsm8k. Ported from FedRot-LoRA/federatedscope/llm"
+requires-python = ">=3.10"
+dependencies = [
+  "flwr[simulation]==1.15.0",
+  "flwr-datasets>=0.5.0",
+  "torch==2.3.1",
+  "trl==0.8.1",
+  "bitsandbytes==0.45.0",
+  "peft==0.13.2",
+  "transformers==4.48.0",
+  "omegaconf==2.3.0",
+  "datasets",
+  "requests",
+]
+# NOT declared as formal dependencies here (both need a manual install step, see below), but
+# required for this app to actually run:
+#
+# 1. Root package (flowertune_llm.models/strategies/peft_layers, fedbench_common instrumentation/
+#    partitioners) -- pip doesn't support relative `file://../../` URIs, so install it directly
+#    into the same venv instead: `pip install -e .` from the repo root, before installing this app.
+#
+# 2. human-eval (HumanEval pass@1 scoring, see eval_humaneval.py::enable_code_execution) --
+#    upstream's setup.py has a malformed console_scripts entry_point
+#    ("human_eval.evaluate_functional_correctness" is missing its ":entry_point" callable suffix),
+#    which modern pip rejects outright, and its unpinned setup.py-only build additionally breaks
+#    under pip's isolated build environments once they resolve setuptools>=81 (pkg_resources was
+#    removed from setuptools at that version). Install a locally patched copy instead:
+#      git clone https://github.com/openai/human-eval.git /tmp/human-eval-src
+#      sed -i 's/human_eval.evaluate_functional_correctness",/human_eval.evaluate_functional_correctness:entry_point",/' \
+#        /tmp/human-eval-src/setup.py
+#      pip install "setuptools<81"   # ensure pkg_resources is present in THIS venv
+#      pip install --no-build-isolation /tmp/human-eval-src
+#    We only ever import human_eval.evaluation.evaluate_functional_correctness directly (see
+#    eval_humaneval.py), never the broken console script, so the patch is cosmetic/harmless.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "src.llm_humaneval.server_app:app"
+clientapp = "src.llm_humaneval.client_app:app"
+
+[tool.flwr.app.config]
+model.name = "meta-llama/Meta-Llama-3-8B"
+model.quantization = 4
+model.gradient-checkpointing = true
+model.lora.peft-lora-r = 8
+model.lora.peft-lora-alpha = 16
+model.use-dora = true
+train.save-every-round = 20
+train.run-generation-eval = true
+train.learning-rate-max = 0.005
+train.learning-rate-min = 1e-6
+train.seq-length = 650
+train.training-arguments.output-dir = ""
+train.training-arguments.learning-rate = ""
+train.training-arguments.per-device-train-batch-size = 1
+train.training-arguments.gradient-accumulation-steps = 1
+train.training-arguments.logging-steps = 10
+train.training-arguments.num-train-epochs = 1
+train.training-arguments.max-steps = 30
+train.training-arguments.save-strategy = "no"
+train.training-arguments.gradient-checkpointing = true
+train.training-arguments.lr-scheduler-type = "constant"
+strategy.aggregation = "fedrot"
+strategy.fraction-fit = 1.0
+strategy.fraction-evaluate = 0.0
+strategy.fedsvd.recalculate-svd-period = 5
+strategy.fedsvd.svd-warmup-steps = 0
+strategy.flora.merge-into-base = true
+strategy.fedrot.rotate = true
+strategy.fedrot.initial-share = "A"
+federate.client-num = 6
+num-server-rounds = 100
+seed = 13
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 6
+options.backend.client-resources.num-cpus = 8
+options.backend.client-resources.num-gpus = 0.5

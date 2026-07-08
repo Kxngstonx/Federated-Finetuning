@@ -164,4 +164,9 @@ cython_debug/
 .vscode/
 
 # training outputs / checkpoints
+results
 results/
+
+# secrets -- should live outside the repo (e.g. ~/.hf_token), but ignored here too as a safety net
+*.token
+.hf_token

@@ -41,14 +41,25 @@ def get_model(model_cfg: DictConfig):
     model_name = model_choices.get(model_cfg.name.lower(), model_cfg.name)
 
     # Handle different quantization settings
+    # device_map is pinned to a single GPU ({"": 0}), not "auto": when this is called from a
+    # Ray-isolated client actor (only one GPU visible via CUDA_VISIBLE_DEVICES), "auto" already
+    # degenerates to that single visible device, so this is a no-op there. But when called from
+    # the (non-Ray-isolated) server process to build init_model, "auto" would see every physical
+    # GPU and naively pipeline-split the model's layers across all of them -- harmless for
+    # init_model specifically (it's only ever used once to read off initial parameter shapes/
+    # values, never for actual forward/generate compute), but still wastes memory on every GPU
+    # and, if this function is ever called somewhere that DOES run inference (as
+    # apps/llm-gsm8k/eval_gsm8k.py and apps/llm-humaneval/eval_humaneval.py's own separate
+    # load_model() used to,
+    # before being fixed the same way), causes real ping-pong slowdown during generation.
     if model_cfg.quantization == 4:
         quantization_config = BitsAndBytesConfig(load_in_4bit=True)
         torch_dtype = torch.bfloat16
-        device_map = "auto"
+        device_map = {"": 0} if torch.cuda.is_available() else "cpu"
     elif model_cfg.quantization == 8:
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         torch_dtype = torch.bfloat16
-        device_map = "auto"
+        device_map = {"": 0} if torch.cuda.is_available() else "cpu"
     elif model_cfg.quantization == 0:
         quantization_config = None  # No quantization
         torch_dtype = torch.float32  # Ensure compatibility with CPU training
@@ -85,6 +96,18 @@ def get_model(model_cfg: DictConfig):
     return get_peft_model(model, peft_config)
 
 
+def _is_bnb_param4bit(tensor) -> bool:
+    """Whether `tensor` is a bitsandbytes 4-bit quantized parameter. Returns False (rather than
+    raising) when bitsandbytes isn't relevant to the current model, e.g. an unquantized RoBERTa
+    base layer -- see set_parameters's base_layer_updates branch below."""
+    try:
+        import bitsandbytes as bnb
+
+        return isinstance(tensor, bnb.nn.Params4bit)
+    except ImportError:
+        return False
+
+
 def set_parameters(
     model,
     parameters: NDArrays,
@@ -93,11 +116,14 @@ def set_parameters(
     """Change the parameters of the model using the given ones.
 
     `base_layer_updates`, if given, maps a LoRA target module's name (as in
-    `peft_layers.index_lora_layers(model)`) to a float32 master weight array (FLoRA only). Each
-    is re-quantized fresh from that master value using the exact quantization arguments
-    (blocksize/quant_type/compress_statistics/quant_storage) the model's own base layer was
-    already loaded with -- never hardcoded -- and swapped in as the module's new frozen
-    `base_layer.weight`. See strategies/flora.py for why the master itself must stay exact.
+    `peft_layers.index_lora_layers(model)`) to a float32 master weight array (FLoRA only). If the
+    module's existing base_layer.weight is bitsandbytes-quantized (Llama/CAUSAL_LM pipeline), the
+    master is re-quantized fresh using the exact quantization arguments (blocksize/quant_type/
+    compress_statistics/quant_storage) the model's own base layer was already loaded with -- never
+    hardcoded -- and swapped in as the module's new frozen `base_layer.weight`. See
+    strategies/flora.py for why the master itself must stay exact. If the base layer is NOT
+    quantized (e.g. an unquantized RoBERTa/SEQ_CLS model), the float32 master is assigned directly
+    (cast to the existing weight's dtype) with no quantization round-trip.
     """
     peft_state_dict_keys = get_peft_model_state_dict(model).keys()
     params_dict = zip(peft_state_dict_keys, parameters)
@@ -105,32 +131,37 @@ def set_parameters(
     set_peft_model_state_dict(model, state_dict)
 
     if base_layer_updates:
-        import bitsandbytes as bnb
-
         for name, w0_array in base_layer_updates.items():
             module = model.get_submodule(name)
-            existing = module.base_layer.weight  # bnb.nn.Params4bit
+            existing = module.base_layer.weight
             device = existing.device
-            w0_tensor = torch.from_numpy(w0_array).to(device=device, dtype=torch.float32)
-            w0_4bit, quant_state = bnb.functional.quantize_4bit(
-                w0_tensor,
-                blocksize=existing.blocksize,
-                compress_statistics=existing.compress_statistics,
-                quant_type=existing.quant_type,
-                quant_storage=existing.quant_storage,
-            )
-            new_param = bnb.nn.Params4bit(
-                w0_4bit,
-                requires_grad=False,
-                quant_state=quant_state,
-                blocksize=existing.blocksize,
-                compress_statistics=existing.compress_statistics,
-                quant_type=existing.quant_type,
-                quant_storage=existing.quant_storage,
-                module=module.base_layer,
-                bnb_quantized=True,
-            )
-            module.base_layer.weight = new_param
+
+            if _is_bnb_param4bit(existing):
+                import bitsandbytes as bnb
+
+                w0_tensor = torch.from_numpy(w0_array).to(device=device, dtype=torch.float32)
+                w0_4bit, quant_state = bnb.functional.quantize_4bit(
+                    w0_tensor,
+                    blocksize=existing.blocksize,
+                    compress_statistics=existing.compress_statistics,
+                    quant_type=existing.quant_type,
+                    quant_storage=existing.quant_storage,
+                )
+                new_param = bnb.nn.Params4bit(
+                    w0_4bit,
+                    requires_grad=False,
+                    quant_state=quant_state,
+                    blocksize=existing.blocksize,
+                    compress_statistics=existing.compress_statistics,
+                    quant_type=existing.quant_type,
+                    quant_storage=existing.quant_storage,
+                    module=module.base_layer,
+                    bnb_quantized=True,
+                )
+                module.base_layer.weight = new_param
+            else:
+                w0_tensor = torch.from_numpy(w0_array).to(device=device, dtype=existing.dtype)
+                module.base_layer.weight = torch.nn.Parameter(w0_tensor, requires_grad=False)
 
 
 def get_parameters(model) -> NDArrays:

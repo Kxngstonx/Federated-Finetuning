@@ -17,6 +17,7 @@ the DoRA magnitude vector m, which is trained normally client-side (no freezing)
 carried along by the same uniform average, with no special-casing needed.
 """
 
+import pickle
 from logging import WARNING
 from typing import List, Optional, Tuple, Union
 
@@ -35,6 +36,10 @@ from flwr.common.logger import log
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
+from fedbench_common.subspace_metrics import mean_pairwise_subspace_overlap
+
+_PREROT_A_METRIC_PREFIX = "fedrot_prerot_A::"
+
 
 class FedRot(FedAvg):
     """FedAvg variant that replaces data-size-weighted averaging with a plain unweighted
@@ -43,8 +48,14 @@ class FedRot(FedAvg):
     client arrays are combined."""
 
     def __init__(self, *, model=None, cfg=None, **kwargs) -> None:
-        del model, cfg  # unused; accepted for signature parity with the other strategy factories
+        del cfg  # unused; accepted for signature parity with the other strategy factories
         super().__init__(**kwargs)
+        # Needed only to recover each LoRA layer's idx_a/name for the basis-overlap metric below;
+        # the rotation itself (client_app.py::FlowerClient._maybe_rotate) doesn't need the model
+        # server-side at all.
+        from flowertune_llm.peft_layers import index_lora_layers
+
+        self._layers = index_lora_layers(model) if model is not None else None
 
     def aggregate_fit(
         self,
@@ -76,7 +87,44 @@ class FedRot(FedAvg):
         elif server_round == 1:
             log(WARNING, "No fit_metrics_aggregation_fn provided")
 
+        if self._layers:
+            overlap_metrics = self._basis_overlap_metrics(client_arrays, results)
+            metrics_aggregated.update(overlap_metrics)
+
         return parameters_aggregated, metrics_aggregated
+
+    def _basis_overlap_metrics(
+        self,
+        client_arrays: List[NDArrays],
+        results: List[Tuple[ClientProxy, FitRes]],
+    ) -> "dict[str, Scalar]":
+        """Requirement: basis overlap / cosine similarity, FedRot only. Compares client-pair
+        A_i/A_j subspaces both post-rotation (already present in client_arrays, the arrays this
+        round's aggregate averages) and pre-rotation (each client additionally serializes its
+        pre-rotation A into its fit() metrics dict under _PREROT_A_METRIC_PREFIX + layer.name --
+        see client_app.py::FlowerClient._maybe_rotate/fit -- and skips this on round 1, since
+        there's no rotation reference yet, so pre-rotation overlap is only reported from round 2
+        onward). Averaged across layers; per-layer detail is dropped from the top-level scalar
+        metrics dict to keep it small, matching the other strategies' metrics granularity."""
+        post_overlaps, pre_overlaps = [], []
+        for layer in self._layers:
+            post_subspaces = [arr[layer.idx_a] for arr in client_arrays]
+            post_overlaps.append(mean_pairwise_subspace_overlap(post_subspaces))
+
+            prerot_key = f"{_PREROT_A_METRIC_PREFIX}{layer.name}"
+            pre_subspaces = []
+            for _, fit_res in results:
+                raw = fit_res.metrics.get(prerot_key)
+                if raw is None:
+                    break
+                pre_subspaces.append(pickle.loads(raw))
+            if len(pre_subspaces) == len(client_arrays):
+                pre_overlaps.append(mean_pairwise_subspace_overlap(pre_subspaces))
+
+        metrics: "dict[str, Scalar]" = {"fedrot_basis_overlap_post": float(np.mean(post_overlaps))}
+        if pre_overlaps:
+            metrics["fedrot_basis_overlap_pre"] = float(np.mean(pre_overlaps))
+        return metrics
 
 
 def rotation_align_optimization(
