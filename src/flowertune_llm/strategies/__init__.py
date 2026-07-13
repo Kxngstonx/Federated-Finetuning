@@ -15,6 +15,7 @@ from flowertune_llm.strategies.fedrot import FedRot
 from flowertune_llm.strategies.fedsvd import FedSVD
 from flowertune_llm.strategies.ffalora import FFALoRA
 from flowertune_llm.strategies.flora import FLoRA
+from flowertune_llm.strategies.rolora import RoLoRA
 
 STRATEGY_REGISTRY: Dict[str, Callable[..., FedAvg]] = {
     "fedavg": lambda *, model=None, cfg=None, **kwargs: FedAvg(**kwargs),
@@ -24,6 +25,7 @@ STRATEGY_REGISTRY: Dict[str, Callable[..., FedAvg]] = {
     "fedrot": lambda *, model=None, cfg=None, **kwargs: FedRot(model=model, cfg=cfg, **kwargs),
     "fedit": lambda *, model=None, cfg=None, **kwargs: FedIT(model=model, cfg=cfg, **kwargs),
     "ffalora": lambda *, model, cfg=None, **kwargs: FFALoRA(model=model, cfg=cfg, **kwargs),
+    "rolora": lambda *, model=None, cfg=None, **kwargs: RoLoRA(model=model, cfg=cfg, **kwargs),
 }
 
 

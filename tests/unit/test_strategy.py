@@ -461,9 +461,9 @@ def test_fedrot_first_round_skips_rotation():
     assert torch.allclose(b_new @ a_new, b @ a, atol=1e-4)
 
 
-def test_fedrot_aggregates_via_uniform_mean_not_data_weighted():
-    """FedRot deliberately does NOT weight by client dataset size -- plain arithmetic mean
-    across clients, applied uniformly to lora_A, lora_B, and (if present) DoRA's m."""
+def test_fedrot_aggregates_via_data_weighted_mean():
+    """FedRot aggregation matches FedAvg -- data-size-weighted averaging across clients,
+    applied uniformly to lora_A, lora_B, and (if present) DoRA's m."""
     model = make_model(use_dora=True)
     template = get_parameters(model)
     from flowertune_llm.strategies.fedrot import FedRot
@@ -472,8 +472,7 @@ def test_fedrot_aggregates_via_uniform_mean_not_data_weighted():
     assert isinstance(strategy, FedAvg)
 
     rng = np.random.default_rng(17)
-    # Deliberately very unequal dataset sizes -- if this were data-weighted, client 2's
-    # values would dominate almost completely; a uniform mean must not show that skew.
+    # Deliberately very unequal dataset sizes so the weighted skew is easy to detect.
     results = _make_fit_results(template, (1, 1000), rng)
 
     parameters_aggregated, _ = strategy.aggregate_fit(1, results, [])
@@ -481,14 +480,14 @@ def test_fedrot_aggregates_via_uniform_mean_not_data_weighted():
 
     client_arrays = [parameters_to_ndarrays(res.parameters) for _, res in results]
     for i in range(len(template)):
-        expected = (client_arrays[0][i].astype(np.float32) + client_arrays[1][i].astype(np.float32)) / 2
-        assert np.allclose(aggregated[i], expected, atol=1e-4)
-        # Sanity: the (heavily) weighted average would differ substantially from the plain mean.
         weighted = (1 / 1001) * client_arrays[0][i].astype(np.float32) + (1000 / 1001) * client_arrays[1][
             i
         ].astype(np.float32)
+        assert np.allclose(aggregated[i], weighted, atol=1e-3)
+        # Sanity: the plain unweighted mean would differ substantially from the weighted one.
+        uniform = (client_arrays[0][i].astype(np.float32) + client_arrays[1][i].astype(np.float32)) / 2
         if not np.allclose(client_arrays[0][i], client_arrays[1][i]):
-            assert not np.allclose(aggregated[i], weighted, atol=1e-3)
+            assert not np.allclose(aggregated[i], uniform, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------

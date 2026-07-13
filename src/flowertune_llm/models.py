@@ -81,6 +81,13 @@ def get_model(model_cfg: DictConfig):
         model, use_gradient_checkpointing=model_cfg.gradient_checkpointing
     )
 
+    # RoLoRA (https://arxiv.org/abs/2407.08044): optionally rotate the frozen base weights
+    # before LoRA is attached, so LoRA trains against outlier-free activations. Opt-in via
+    # model.rolora.rotate; no-op (and independent of strategy.aggregation) otherwise.
+    from flowertune_llm.strategies.rolora import apply_rotation
+
+    apply_rotation(model, model_cfg.get("rolora", {}))
+
     # LoRA / DoRA Configuration (Optimized for Small Models)
     # DoRA (https://arxiv.org/abs/2402.09353) decomposes the LoRA update into
     # magnitude and direction; toggle via model.use-dora in pyproject.toml.

@@ -94,7 +94,7 @@ class InstrumentedStrategy(FedAvg):
         client's already-reported `upload_bytes` fit metric (see client_app.py in both new apps)
 
     Delegates every other method to the wrapped strategy unchanged, so strategy-specific metrics
-    (e.g. fedrot_basis_overlap_*, flora_quant_error_frob, fedora_v1_basis_overlap_mean -- all
+    (e.g. fedrot_basis_overlap_*, flora_quant_error_frob, fedora_basis_overlap_mean -- all
     added directly inside the respective strategy's own aggregate_fit, see strategies/fedrot.py,
     flora.py, fedora.py) simply pass through untouched in the merged metrics dict.
     """

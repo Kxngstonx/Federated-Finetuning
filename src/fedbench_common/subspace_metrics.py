@@ -1,4 +1,4 @@
-"""Basis-overlap / cosine-similarity metrics -- FedRot-LoRA and FeDoRA (v1 + v2) only, per the
+"""Basis-overlap / cosine-similarity metrics -- FedRot-LoRA and FeDoRA only, per the
 experiment plan. Not applicable to the other 5 strategies (fedavg, fedit, fedsvd, ffalora,
 flora), which don't have a well-defined "reference direction" to compare a client's basis
 against in the same sense.
