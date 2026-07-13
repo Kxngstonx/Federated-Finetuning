@@ -8,6 +8,7 @@ no assumption about task type (SEQ_CLS vs CAUSAL_LM).
 
 from typing import Optional
 
+import torch
 from omegaconf import DictConfig
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForSequenceClassification
@@ -33,8 +34,11 @@ def get_model(model_cfg: DictConfig, task_name: str, aggregation: Optional[str] 
     strategy in an experiment sweep without per-strategy config edits.
     """
     num_labels = GLUE_NUM_LABELS[task_name]
+    # FedRot-LoRA/federatedscope/glue/model/model_builder.py's is_enable_half=True protocol
+    # casts RoBERTa-Large to fp16 for GLUE fine-tuning -- torch_dtype at from_pretrained time
+    # matches that (equivalent to loading fp32 then .half()).
     base = AutoModelForSequenceClassification.from_pretrained(
-        model_cfg.name, num_labels=num_labels
+        model_cfg.name, num_labels=num_labels, torch_dtype=torch.float16
     )
 
     use_dora = model_cfg.get("use_dora", False) or aggregation == "fedora"

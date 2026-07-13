@@ -70,6 +70,13 @@ class FlowerClient(NumPyClient):
             model.to(self.device)
             if self.aggregation in FREEZE_A_STRATEGIES:
                 freeze_params(model, FROZEN_PARAM_SUBSTRINGS)
+            # PEFT's PeftModelForSequenceClassification unconditionally adds the classifier head
+            # to modules_to_save (peft/peft_model.py) for TaskType.SEQ_CLS, keeping it trainable
+            # (full fine-tuning, not LoRA) alongside the adapters -- this matches FedRot-LoRA's
+            # own protocol, which does NOT freeze the classifier head: every client uploads it
+            # each round via get_peft_model_state_dict (any requires_grad=True param, LoRA or
+            # not) and it's aggregated same as the LoRA arrays (see fedora.py's plain-FedAvg
+            # fallback for the non-LoRA arrays get_peft_model_state_dict returns).
             return model
 
         self.model = get_cached_model(cache_key, _build_model)
@@ -99,13 +106,18 @@ class FlowerClient(NumPyClient):
         # pipeline's GSM8K collapse (see llm_humaneval/client_app.py's identical note). grad.grad_clip
         # also defaults to -1 (disabled) upstream and is never overridden, unlike HF's own
         # max_grad_norm=1.0 default.
+        # learning_rate/output_dir are "" placeholders in self.train_cfg.training_arguments (see
+        # apps/glue-nlu/pyproject.toml) meant to be filled in per-round/per-client here -- passed
+        # as constructor kwargs alongside **training_arguments this collides (TypeError: multiple
+        # values for keyword argument), so set them as attributes after construction instead,
+        # matching flowertune_llm/client_app.py's identical pattern.
         training_args = TrainingArguments(
             **self.train_cfg.training_arguments,
-            learning_rate=self.train_cfg.learning_rate_max,
-            output_dir=config["save_path"],
             optim="sgd",
             max_grad_norm=0,
         )
+        training_args.learning_rate = self.train_cfg.learning_rate_max
+        training_args.output_dir = config["save_path"]
 
         trainer = Trainer(
             model=self.model,

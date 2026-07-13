@@ -17,6 +17,7 @@ from flwr.common import (
 from flwr.common.logger import log
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
+from flwr.server.strategy.aggregate import aggregate
 
 from flowertune_llm.strategies.common import _LoraLayerRef, build_layer_refs
 from fedbench_common.subspace_metrics import mean_subspace_overlap
@@ -123,6 +124,18 @@ class FeDoRA(FedAvg):
             if layer.idx_m is not None:
                 aggregated[layer.idx_m] = m_new
             layer_overlaps.append(overlap)
+
+        # Any index not covered by an indexed LoRA/DoRA layer is a non-LoRA trainable param
+        # PEFT still returns from get_peft_model_state_dict -- e.g. glue-nlu's classifier head,
+        # auto-added to modules_to_save for TaskType.SEQ_CLS. flowertune_llm's own CAUSAL_LM
+        # models have no such params (every trainable array is a LoRA layer), so this was never
+        # exercised there; left as `None` here it makes ndarrays_to_parameters's np.save blow up
+        # with "Object arrays cannot be saved when allow_pickle=False". Fall back to plain
+        # weighted FedAvg for these, matching flora.py's identical fallback for its extra arrays.
+        for idx, arr in enumerate(aggregated):
+            if arr is None:
+                per_client = [([client[idx]], n) for client, n in zip(client_arrays, num_examples)]
+                aggregated[idx] = aggregate(per_client)[0]
 
         parameters_aggregated = ndarrays_to_parameters(aggregated)
 

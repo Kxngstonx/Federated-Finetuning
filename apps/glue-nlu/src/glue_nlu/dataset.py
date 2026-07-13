@@ -27,10 +27,16 @@ TASK_TO_KEYS = {
 }
 
 _FDS_CACHE: dict = {}  # keyed by (task_name, num_partitions, alpha, seed) -- one per config
+_TOKENIZER_CACHE: dict = {}  # keyed by model_name -- AutoTokenizer.from_pretrained is ~250ms,
+# uncached, and Flower's simulation re-invokes client_fn() (hence get_tokenizer()) fresh every
+# round for every client -- across 50 clients/round split over a handful of Ray actors, that's
+# several wasted seconds of pure re-initialization per round for a tokenizer that never changes.
 
 
 def get_tokenizer(model_name: str) -> AutoTokenizer:
-    return AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if model_name not in _TOKENIZER_CACHE:
+        _TOKENIZER_CACHE[model_name] = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    return _TOKENIZER_CACHE[model_name]
 
 
 def _preprocess_fn(tokenizer, task_name: str, seq_length: int):

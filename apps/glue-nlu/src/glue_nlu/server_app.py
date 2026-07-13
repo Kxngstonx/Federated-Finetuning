@@ -24,7 +24,7 @@ from glue_nlu.models import get_model
 
 def get_evaluate_fn(
     model_cfg, task_name, tokenizer, seq_length, save_path, metrics_writer, eval_freq,
-    save_every_round, total_round,
+    save_every_round, total_round, aggregation,
 ):
     """Centralized eval on the full validation(_matched) split -- FedRot-LoRA's own
     federate.make_global_eval=True protocol -- computing accuracy every `eval_freq` rounds (the
@@ -41,16 +41,43 @@ def get_evaluate_fn(
     eval_dataset = eval_dataset.rename_column("label", "labels")
     eval_dataset.set_format(type="torch")
 
+    # Built once here (closure state), not inside evaluate() -- get_model() does a real
+    # AutoModelForSequenceClassification.from_pretrained + PEFT LoRA wrap, not free, and unlike
+    # the client side (get_cached_model) this had no caching: every eval_freq-th round was paying
+    # that full construction cost again just to immediately overwrite every weight via
+    # set_parameters() below anyway. One instance, reused every round, only its parameter values
+    # change.
+    model = get_model(model_cfg, task_name, aggregation)
+
     def evaluate(server_round: int, parameters, config):
         if server_round == 0 or server_round % eval_freq != 0:
             return 0.0, {}
 
-        model = get_model(model_cfg, task_name)
         set_parameters(model, parameters)
 
+        # This runs in the ServerApp's own process, outside Ray's per-client client_resources
+        # accounting -- the simulation's actor pool keeps every client's RoBERTa-Large resident
+        # on GPU for the whole run (see run_glue_n50_experiment.sh's num-gpus sizing comment), so
+        # this competes with that fixed VRAM budget. At num-gpus=0.33 (3 clients/GPU, ~15.45GB of
+        # 15.47GB used) there was no room left and this OOM'd; forced to CPU as a workaround. At
+        # the current num-gpus=0.5 (2 clients/GPU, ~11.2GB used, ~4GB headroom) it fits again --
+        # measured eval's own forward-only (no backward, no optimizer state) peak at batch=64 is
+        # only ~1GB, well under the ~4GB headroom. Revisit (back to use_cpu=True) if num-gpus is
+        # ever raised again without rechecking this headroom.
         eval_args = TrainingArguments(
             output_dir=save_path, per_device_eval_batch_size=64, report_to=[]
         )
+        # Unlike a Ray-isolated client actor, this process sees both physical GPUs, so Trainer's
+        # default n_gpu>1 behavior wraps the model in nn.DataParallel and replicates it onto GPU1
+        # too (torch/nn/parallel/data_parallel.py) -- but GPU1 is exclusively owned by two other
+        # Ray actor processes' own CUDA contexts at this point, and DataParallel's cross-GPU
+        # broadcast into that already-occupied device crashes with "CUDA error: illegal memory
+        # access" (confirmed). Force n_gpu=1 so eval stays a plain single-GPU (cuda:0) forward
+        # pass -- accessing .device first to trigger TrainingArguments' lazy _setup_devices
+        # before overriding the _n_gpu it sets, per transformers.TrainingArguments.n_gpu's own
+        # "make sure _n_gpu is properly setup" comment.
+        _ = eval_args.device
+        eval_args._n_gpu = 1
         trainer = Trainer(model=model, args=eval_args)
         predictions = trainer.predict(eval_dataset)
         preds = np.argmax(predictions.predictions, axis=-1)
@@ -139,7 +166,7 @@ def server_fn(context: Context):
         evaluate_fn=get_evaluate_fn(
             cfg.model, task_name, tokenizer, cfg.train.seq_length, save_path,
             metrics_writer, cfg.get("eval", {}).get("freq", 1),
-            cfg.train.get("save_every_round", 25), num_rounds,
+            cfg.train.get("save_every_round", 25), num_rounds, aggregation,
         ),
     )
     strategy = build_strategy(
