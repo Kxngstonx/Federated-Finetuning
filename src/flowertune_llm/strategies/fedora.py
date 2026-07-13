@@ -133,11 +133,11 @@ class FeDoRA(FedAvg):
         elif server_round == 1:
             log(WARNING, "No fit_metrics_aggregation_fn provided")
 
-        # Requirement: basis overlap / cosine similarity, FeDoRA v1 -- each client's raw
+        # Requirement: basis overlap / cosine similarity, FeDoRA -- each client's raw
         # (unrotated) local A_i vs the SVD-derived shared reference A_new computed in
-        # aggregate_dora_layer's step 2 (there is no explicit per-client rotation in v1).
+        # aggregate_dora_layer's step 2 (there is no explicit per-client rotation).
         if layer_overlaps:
-            metrics_aggregated["fedora_v1_basis_overlap_mean"] = float(np.mean(layer_overlaps))
+            metrics_aggregated["fedora_basis_overlap_mean"] = float(np.mean(layer_overlaps))
 
         return parameters_aggregated, metrics_aggregated
 

@@ -9,12 +9,11 @@ supported: both A and B are always shared, rotated first. The rotation itself ha
 client-side inside client_app.py::FlowerClient.fit (using the just-received global parameters as
 the alignment reference -- no extra communication or cross-round state needed).
 
-Server-side aggregation is a **plain, unweighted arithmetic mean** across selected clients --
-deliberately *not* data-size-weighted FedAvg (a chosen deviation from the source repo's own
-FederatedScope aggregator, which does weight by client dataset size). This applies uniformly to
-every array this pipeline's clients report -- lora_A, lora_B, and (when model.use-dora=true)
-the DoRA magnitude vector m, which is trained normally client-side (no freezing) and simply
-carried along by the same uniform average, with no special-casing needed.
+Server-side aggregation is data-size-weighted, matching FedAvg: each client's arrays are
+weighted by its `num_examples` before averaging. This applies uniformly to every array this
+pipeline's clients report -- lora_A, lora_B, and (when model.use-dora=true) the DoRA magnitude
+vector m, which is trained normally client-side (no freezing) and simply carried along by the
+same weighted average, with no special-casing needed.
 """
 
 import pickle
@@ -42,10 +41,10 @@ _PREROT_A_METRIC_PREFIX = "fedrot_prerot_A::"
 
 
 class FedRot(FedAvg):
-    """FedAvg variant that replaces data-size-weighted averaging with a plain unweighted
-    arithmetic mean -- FedRot's rotation step happens client-side before upload (see
-    client_app.py::FlowerClient.fit); this class only changes how the (already rotated)
-    client arrays are combined."""
+    """FedAvg variant where FedRot's rotation step happens client-side before upload (see
+    client_app.py::FlowerClient.fit); this class only adds the post-hoc basis-overlap metrics
+    on top of standard FedAvg data-size-weighted averaging of the (already rotated) client
+    arrays."""
 
     def __init__(self, *, model=None, cfg=None, **kwargs) -> None:
         del cfg  # unused; accepted for signature parity with the other strategy factories
@@ -71,12 +70,17 @@ class FedRot(FedAvg):
         client_arrays: List[NDArrays] = [
             parameters_to_ndarrays(fit_res.parameters) for _, fit_res in results
         ]
+        weights = np.array(
+            [fit_res.num_examples for _, fit_res in results], dtype=np.float32
+        )
+        weights /= weights.sum()
 
         aggregated: NDArrays = []
         for i in range(len(client_arrays[0])):
             dtype = client_arrays[0][i].dtype
             stacked = np.stack([arr[i].astype(np.float32, copy=False) for arr in client_arrays], axis=0)
-            aggregated.append(stacked.mean(axis=0).astype(dtype, copy=False))
+            weighted_sum = np.tensordot(weights, stacked, axes=1)
+            aggregated.append(weighted_sum.astype(dtype, copy=False))
 
         parameters_aggregated = ndarrays_to_parameters(aggregated)
 
