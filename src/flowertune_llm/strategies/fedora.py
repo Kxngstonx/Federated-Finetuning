@@ -42,9 +42,10 @@ def aggregate_dora_layer(
     `target_modules` restricted accordingly (e.g. via pyproject.toml).
 
     `diagnostics`, when True, additionally computes and returns (as a 4th tuple element, a dict)
-    step 3's Gram-matrix condition number, the rank-r reconstruction residual of `m`, and each
-    client's raw-A overlap with the new shared basis -- collapse-investigation instrumentation,
-    off by default so normal runs pay none of this cost."""
+    step 3's Gram-matrix condition number, a row-wise direction-cosine check of the rank-r
+    reconstruction against the true aggregated weight, and each client's raw-A overlap with the
+    new shared basis -- collapse-investigation instrumentation, off by default so normal runs pay
+    none of this cost."""
     is_dora_layer = m_list is not None
 
     # --- Step 1: reconstruct each client's effective weight, FedAvg them ---
@@ -81,15 +82,33 @@ def aggregate_dora_layer(
         eigvals = torch.linalg.eigvalsh(aat).clamp_min(_EPS)
         aat_cond = float((eigvals.max() / eigvals.min()).item())
 
-        recon = scaling * (b_new @ a_new)
-        m_norm = m.norm().clamp_min(_EPS)
-        residual = float((m - recon).norm().item() / m_norm.item())
+        # Row-wise direction cosine between the reconstructed direction (W0 + scaling*B_new@A_new)
+        # and the true aggregated weight w_global -- NOT a raw ||m - recon|| residual, because `m`
+        # is contaminated by DoRA's per-row magnitude renormalization in step 1: w_c =
+        # diag(m_c/||v_c||_row) @ (W0 + scaling*B_c@A_c) means w_global - W0 decomposes into a
+        # low-rank "direction" term PLUS (D - I) @ W0 (D := the weighted-average per-row magnitude
+        # ratio, a diagonal matrix). Row-scaling preserves row space, so that second term has
+        # exactly W0's own row space -- generically ~full rank for a real linear layer weight,
+        # utterly unreachable by any rank-r a_new regardless of how good the basis is. A raw
+        # ||m - recon||/||m|| ratio is dominated by that unreachable term and sits pinned near 1.0
+        # whether the round is healthy or collapsing (confirmed empirically: stayed at
+        # 1.000003-1.000012 through an actual collapse event). Cosine similarity is scale-invariant
+        # per row, so it cancels out the (D-I)@W0 magnitude-scale contamination automatically and
+        # isolates just the question step 3 is actually responsible for: does the reconstructed
+        # direction point the same way as the true averaged weight, row by row.
+        v_new = W0 + scaling * (b_new @ a_new)
+        target_norm = w_global.norm(dim=1).clamp_min(_EPS)
+        recon_norm = v_new.norm(dim=1).clamp_min(_EPS)
+        row_cosine = (w_global * v_new).sum(dim=1) / (target_norm * recon_norm)
+        direction_cosine_mean = float(row_cosine.mean().item())
+        direction_cosine_min = float(row_cosine.min().item())
 
         per_client_overlap = [mean_subspace_overlap(a_c, a_new) for a_c in a_list]
 
         diag = {
             "aat_cond": aat_cond,
-            "residual": residual,
+            "direction_cosine_mean": direction_cosine_mean,
+            "direction_cosine_min": direction_cosine_min,
             "per_client_overlap": per_client_overlap,
         }
 
@@ -146,7 +165,8 @@ class FeDoRA(FedAvg):
         layer_overlaps: List[float] = []
         layer_overlaps_min: List[float] = []
         layer_aat_cond: List[float] = []
-        layer_residual: List[float] = []
+        layer_direction_cosine: List[float] = []
+        layer_direction_cosine_min: List[float] = []
         layer_per_client_overlap: List[List[float]] = []
         for layer in self._layers:
             a_new, b_new, m_new, overlap_mean, overlap_min, diag = self._aggregate_layer(
@@ -160,7 +180,8 @@ class FeDoRA(FedAvg):
             layer_overlaps_min.append(overlap_min)
             if diag is not None:
                 layer_aat_cond.append(diag["aat_cond"])
-                layer_residual.append(diag["residual"])
+                layer_direction_cosine.append(diag["direction_cosine_mean"])
+                layer_direction_cosine_min.append(diag["direction_cosine_min"])
                 layer_per_client_overlap.append(diag["per_client_overlap"])
 
         # Any index not covered by an indexed LoRA/DoRA layer is a non-LoRA trainable param
@@ -208,17 +229,24 @@ class FeDoRA(FedAvg):
         # Opt-in collapse-investigation diagnostics (strategy.fedora.debug-diagnostics=true) --
         # off by default since per-client breakdowns would otherwise need to be recomputed and
         # logged on every production run for no benefit. `aat_cond` tests (and is expected to
-        # rule out) step 3's closed-form solve being numerically ill-conditioned; `residual` tests
-        # whether the SVD-derived shared basis fails to capture the true aggregated weight delta
-        # `m` in a given round; `client_overlap_mean/_min` are per-client (not cross-client-mean)
-        # so a single outlier client distorting the unweighted SVD stack (step 2 doesn't weight by
-        # `freqs` the way step 1's FedAvg does) becomes visible instead of averaged away into
-        # ~148 healthy layers times 2 healthy clients.
+        # rule out) step 3's closed-form solve being numerically ill-conditioned. `direction_cosine`
+        # tests whether the SVD-derived shared basis fails to capture the true aggregated weight's
+        # *direction* -- deliberately NOT a raw ||m - recon||/||m|| residual, since `m` is
+        # contaminated by DoRA's per-row magnitude renormalization (see aggregate_dora_layer's
+        # comment): w_global - W0 has a (D-I)@W0 component whose row space equals W0's own
+        # (generically ~full rank), structurally unreachable by any rank-r a_new regardless of
+        # basis quality, which pinned a raw residual at ~1.0 even during an actual collapse when
+        # first tried. Row-wise cosine similarity is scale-invariant, so it cancels that
+        # magnitude-scale contamination and isolates just what step 3 is responsible for.
+        # `client_overlap_mean/_min` are per-client (not cross-client-mean) so a single outlier
+        # client distorting the unweighted SVD stack (step 2 doesn't weight by `freqs` the way
+        # step 1's FedAvg does) becomes visible instead of averaged away into ~148 healthy layers
+        # times 2 healthy clients.
         if self._debug_diagnostics and layer_aat_cond:
             metrics_aggregated["fedora_aat_cond_mean"] = float(np.mean(layer_aat_cond))
             metrics_aggregated["fedora_aat_cond_max"] = float(np.max(layer_aat_cond))
-            metrics_aggregated["fedora_residual_mean"] = float(np.mean(layer_residual))
-            metrics_aggregated["fedora_residual_max"] = float(np.max(layer_residual))
+            metrics_aggregated["fedora_direction_cosine_mean"] = float(np.mean(layer_direction_cosine))
+            metrics_aggregated["fedora_direction_cosine_min"] = float(np.min(layer_direction_cosine_min))
 
             per_client_arr = np.array(layer_per_client_overlap)  # (num_layers, num_clients)
             client_overlap_mean = per_client_arr.mean(axis=0)
