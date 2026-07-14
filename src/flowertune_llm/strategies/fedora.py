@@ -20,7 +20,7 @@ from flwr.server.strategy import FedAvg
 from flwr.server.strategy.aggregate import aggregate
 
 from flowertune_llm.strategies.common import _LoraLayerRef, build_layer_refs
-from fedbench_common.subspace_metrics import mean_subspace_overlap
+from fedbench_common.subspace_metrics import mean_subspace_overlap, overlap_to_misalign_deg
 
 _EPS = 1e-8
 
@@ -117,13 +117,17 @@ class FeDoRA(FedAvg):
 
         aggregated: NDArrays = [None] * len(client_arrays[0])
         layer_overlaps: List[float] = []
+        layer_overlaps_min: List[float] = []
         for layer in self._layers:
-            a_new, b_new, m_new, overlap = self._aggregate_layer(layer, client_arrays, num_examples)
+            a_new, b_new, m_new, overlap_mean, overlap_min = self._aggregate_layer(
+                layer, client_arrays, num_examples
+            )
             aggregated[layer.idx_a] = a_new
             aggregated[layer.idx_b] = b_new
             if layer.idx_m is not None:
                 aggregated[layer.idx_m] = m_new
-            layer_overlaps.append(overlap)
+            layer_overlaps.append(overlap_mean)
+            layer_overlaps_min.append(overlap_min)
 
         # Any index not covered by an indexed LoRA/DoRA layer is a non-LoRA trainable param
         # PEFT still returns from get_peft_model_state_dict -- e.g. glue-nlu's classifier head,
@@ -149,8 +153,23 @@ class FeDoRA(FedAvg):
         # Requirement: basis overlap / cosine similarity, FeDoRA -- each client's raw
         # (unrotated) local A_i vs the SVD-derived shared reference A_new computed in
         # aggregate_dora_layer's step 2 (there is no explicit per-client rotation).
+        #
+        # Raw cosine overlap is logged too (for continuity with earlier runs' CSVs/plots), but
+        # it's a poor scale to eyeball for anomalies: it saturates near 1.0, so e.g. the
+        # collapse-triggering QNLI rounds observed in 2026-07-14's sweep showed overlap dropping
+        # only 0.999999 -> ~0.998 (looks tiny) which is actually ~0.08deg -> ~3.2deg of true
+        # subspace misalignment (~40x), because arccos is flat near overlap=1. Logging the
+        # degree-transform (and the worst single layer, not just the cross-layer mean, since one
+        # bad layer can get diluted into ~148 healthy ones) makes that kind of one-round
+        # aggregation-triggered collapse visible in the metrics instead of hiding in the noise
+        # floor of a mean-of-cosines column.
         if layer_overlaps:
-            metrics_aggregated["fedora_basis_overlap_mean"] = float(np.mean(layer_overlaps))
+            overlap_mean_all = float(np.mean(layer_overlaps))
+            overlap_min_all = float(np.min(layer_overlaps_min))
+            metrics_aggregated["fedora_basis_overlap_mean"] = overlap_mean_all
+            metrics_aggregated["fedora_basis_overlap_min"] = overlap_min_all
+            metrics_aggregated["fedora_basis_misalign_deg_mean"] = overlap_to_misalign_deg(overlap_mean_all)
+            metrics_aggregated["fedora_basis_misalign_deg_max"] = overlap_to_misalign_deg(overlap_min_all)
 
         return parameters_aggregated, metrics_aggregated
 
@@ -159,7 +178,7 @@ class FeDoRA(FedAvg):
         layer: _LoraLayerRef,
         client_arrays: List[NDArrays],
         num_examples: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float, float]:
         total = sum(num_examples)
         freqs = [n / total for n in num_examples]
 
@@ -178,8 +197,10 @@ class FeDoRA(FedAvg):
         a_new, b_new, m_new = aggregate_dora_layer(
             layer.W0, layer.scaling, layer.r, a_list, b_list, m_list, freqs,
         )
-        overlap = float(np.mean([mean_subspace_overlap(a_c, a_new) for a_c in a_list]))
+        client_overlaps = [mean_subspace_overlap(a_c, a_new) for a_c in a_list]
+        overlap_mean = float(np.mean(client_overlaps))
+        overlap_min = float(np.min(client_overlaps))
         a_out = a_new.numpy().astype(dtype_a, copy=False)
         b_out = b_new.numpy().astype(dtype_b, copy=False)
         m_out = m_new.numpy().astype(dtype_m, copy=False) if m_new is not None else None
-        return a_out, b_out, m_out, overlap
+        return a_out, b_out, m_out, overlap_mean, overlap_min

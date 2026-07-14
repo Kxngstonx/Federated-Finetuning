@@ -10,6 +10,7 @@ similarity is the correct generalization of "cosine similarity" here. 1.0 = iden
 0.0 = orthogonal subspaces.
 """
 
+import math
 from itertools import combinations
 from typing import Sequence
 
@@ -31,6 +32,14 @@ def mean_subspace_overlap(subspace_a, subspace_b) -> float:
     a_t = subspace_a if isinstance(subspace_a, torch.Tensor) else torch.from_numpy(np.asarray(subspace_a))
     b_t = subspace_b if isinstance(subspace_b, torch.Tensor) else torch.from_numpy(np.asarray(subspace_b))
     return principal_angle_cosines(a_t, b_t).mean().item()
+
+
+def overlap_to_misalign_deg(overlap: float) -> float:
+    """arccos(overlap) in degrees -- overlap alone is a bad anomaly-detection scale: it saturates
+    near 1.0 (cosine is flat there), so e.g. 0.999999 -> 0.998 looks like a tiny 0.0016 drop but
+    is actually ~0.08deg -> ~3.2deg, a ~40x change in true angular misalignment. Clamped into
+    [-1, 1] first since float error can push a numerically-1.0 overlap slightly past 1."""
+    return math.degrees(math.acos(min(max(overlap, -1.0), 1.0)))
 
 
 def mean_pairwise_subspace_overlap(subspaces: Sequence) -> float:
