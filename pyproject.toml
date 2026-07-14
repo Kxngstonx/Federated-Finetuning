@@ -108,6 +108,7 @@ strategy.fedsvd.svd-warmup-steps = 0
 strategy.flora.merge-into-base = true
 strategy.fedrot.rotate = true
 strategy.fedrot.initial-share = "A"
+strategy.fedora.debug-diagnostics = false
 num-server-rounds = 100
 
 [tool.flwr.federations]

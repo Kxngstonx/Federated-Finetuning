@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score
 from transformers import Trainer, TrainingArguments
 
 from flowertune_llm.dataset import replace_keys
-from flowertune_llm.models import get_parameters, set_parameters
+from flowertune_llm.models import get_parameters, set_parameters, load_checkpoint_parameters
 from flowertune_llm.strategies import build_strategy
 
 from fedbench_common.metrics import InstrumentedStrategy, gpu_info
@@ -24,7 +24,7 @@ from glue_nlu.models import get_model
 
 def get_evaluate_fn(
     model_cfg, task_name, tokenizer, seq_length, save_path, metrics_writer, eval_freq,
-    save_every_round, total_round, aggregation,
+    save_every_round, total_round, aggregation, start_round=0,
 ):
     """Centralized eval on the full validation(_matched) split -- FedRot-LoRA's own
     federate.make_global_eval=True protocol -- computing accuracy every `eval_freq` rounds (the
@@ -50,7 +50,10 @@ def get_evaluate_fn(
     model = get_model(model_cfg, task_name, aggregation)
 
     def evaluate(server_round: int, parameters, config):
-        if server_round == 0 or server_round % eval_freq != 0:
+        if server_round == 0:
+            return 0.0, {}
+        effective_round = server_round + start_round
+        if effective_round % eval_freq != 0:
             return 0.0, {}
 
         set_parameters(model, parameters)
@@ -83,19 +86,19 @@ def get_evaluate_fn(
         preds = np.argmax(predictions.predictions, axis=-1)
         acc = accuracy_score(eval_dataset["labels"], preds)
 
-        metrics_writer.write_round(server_round, "eval", accuracy=acc)
+        metrics_writer.write_round(effective_round, "eval", accuracy=acc)
 
-        if server_round == total_round or server_round % save_every_round == 0:
-            model.save_pretrained(f"{save_path}/peft_{server_round}")
+        if effective_round == total_round or effective_round % save_every_round == 0:
+            model.save_pretrained(f"{save_path}/peft_{effective_round}")
 
         return 0.0, {"accuracy": acc}
 
     return evaluate
 
 
-def get_on_fit_config(save_path):
+def get_on_fit_config(save_path, start_round=0):
     def fit_config_fn(server_round: int):
-        return {"current_round": server_round, "save_path": save_path}
+        return {"current_round": server_round + start_round, "save_path": save_path}
 
     return fit_config_fn
 
@@ -133,6 +136,15 @@ def server_fn(context: Context):
     task_name = cfg.dataset.task_name
     aggregation = cfg.strategy.get("aggregation", "fedrot")
 
+    # Resume from a saved adapter checkpoint (peft_<round>/) instead of a fresh random adapter --
+    # checkpoint_path="" (default) disables this. When enabled, `num_rounds` above is the number
+    # of *additional* rounds to run (Flower's own internal round counter always starts at 1), and
+    # `start_round` is added to it everywhere a round number is reported/used for file naming, so
+    # checkpoints/metrics continue the original run's numbering instead of restarting at 1.
+    resume_path = cfg.resume.get("checkpoint_path", "") if "resume" in cfg else ""
+    start_round = int(cfg.resume.get("start_round", 0)) if resume_path else 0
+    final_effective_round = num_rounds + start_round
+
     metrics_writer = MetricsWriter(path=os.path.join(save_path, "metrics.jsonl"))
     write_run_metadata(
         save_path,
@@ -150,23 +162,28 @@ def server_fn(context: Context):
             # --federation-config options.num-supernodes value is actually passed at invocation.
             "client_num": cfg.federate.client_num,
             "start_time": current_time.isoformat(),
+            "resume_from": resume_path or None,
+            "start_round": start_round,
         },
     )
 
     tokenizer = get_tokenizer(cfg.model.name)
     init_model = get_model(cfg.model, task_name, aggregation)
+    if resume_path:
+        set_parameters(init_model, load_checkpoint_parameters(resume_path, init_model))
     init_model_parameters = ndarrays_to_parameters(get_parameters(init_model))
 
     strategy_kwargs = dict(
         fraction_fit=cfg.strategy.fraction_fit,
         fraction_evaluate=cfg.strategy.fraction_evaluate,
-        on_fit_config_fn=get_on_fit_config(save_path),
+        on_fit_config_fn=get_on_fit_config(save_path, start_round),
         fit_metrics_aggregation_fn=fit_weighted_average,
         initial_parameters=init_model_parameters,
         evaluate_fn=get_evaluate_fn(
             cfg.model, task_name, tokenizer, cfg.train.seq_length, save_path,
             metrics_writer, cfg.get("eval", {}).get("freq", 1),
-            cfg.train.get("save_every_round", 25), num_rounds, aggregation,
+            cfg.train.get("save_every_round", 25), final_effective_round, aggregation,
+            start_round,
         ),
     )
     strategy = build_strategy(

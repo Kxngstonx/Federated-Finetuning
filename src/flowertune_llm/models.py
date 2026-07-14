@@ -11,7 +11,7 @@ from peft import (
     get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
-from peft.utils import prepare_model_for_kbit_training
+from peft.utils import prepare_model_for_kbit_training, load_peft_weights
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 from flwr.common.typing import NDArrays
@@ -175,3 +175,14 @@ def get_parameters(model) -> NDArrays:
     """Return the parameters of the current net."""
     state_dict = get_peft_model_state_dict(model)
     return [val.cpu().numpy() for _, val in state_dict.items()]
+
+
+def load_checkpoint_parameters(checkpoint_path: str, reference_model) -> NDArrays:
+    """Load a saved PEFT adapter checkpoint (a `model.save_pretrained(...)` output directory,
+    e.g. `results/<ts>/peft_200/`) as an NDArrays list ordered to match
+    `get_peft_model_state_dict(reference_model)`'s key order -- so the result can be fed straight
+    into `set_parameters(reference_model, ...)`, same as any other round's parameters. Used to
+    resume a federated run from a mid-run checkpoint instead of a fresh random adapter init."""
+    adapter_state_dict = load_peft_weights(checkpoint_path)
+    reference_keys = get_peft_model_state_dict(reference_model).keys()
+    return [adapter_state_dict[k].cpu().numpy() for k in reference_keys]

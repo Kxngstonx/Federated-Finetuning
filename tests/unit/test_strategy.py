@@ -118,9 +118,10 @@ def test_aggregate_dora_layer_math():
     total = sum(num_examples)
     freqs = [n / total for n in num_examples]
 
-    a_new, b_new, m_new = aggregate_dora_layer(
+    a_new, b_new, m_new, diag = aggregate_dora_layer(
         w0, scaling, r, a_list, b_list, m_list, freqs,
     )
+    assert diag is None
 
     assert a_new.shape == (r, in_features)
     assert b_new.shape == (out_features, r)

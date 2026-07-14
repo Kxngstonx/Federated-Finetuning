@@ -67,10 +67,17 @@ strategy.fedsvd.svd-warmup-steps = 0
 strategy.flora.merge-into-base = true
 strategy.fedrot.rotate = true
 strategy.fedrot.initial-share = "A"
+strategy.fedora.debug-diagnostics = false
 federate.client-num = 3
 num-server-rounds = 250
 seed = 13
 eval.freq = 1
+# Resume from a saved adapter checkpoint (a peft_<round>/ dir under some prior results/<ts>/)
+# instead of a fresh random adapter init -- checkpoint-path="" (default) disables this. When set,
+# start-round must match the round the checkpoint was saved at (not auto-parsed from the path),
+# and num-server-rounds is then interpreted as "rounds remaining", not the total.
+resume.checkpoint-path = ""
+resume.start-round = 0
 
 [tool.flwr.federations]
 default = "local-simulation"

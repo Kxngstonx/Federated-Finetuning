@@ -33,12 +33,18 @@ def aggregate_dora_layer(
     b_list: List[torch.Tensor],  # each (out_features, r) float32
     m_list: Optional[List[torch.Tensor]],  # each (out_features,) float32, or None
     freqs: List[float],  # per-client weight, sums to 1.0
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    diagnostics: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
     """Pure-tensor implementation of the 4-step DoRA-aware layer aggregation. All
     inputs/outputs are float32 CPU tensors; numpy/dtype conversion happens in the caller.
 
     Requires target modules whose out/in dimensions are >= r -- callers must keep
-    `target_modules` restricted accordingly (e.g. via pyproject.toml)."""
+    `target_modules` restricted accordingly (e.g. via pyproject.toml).
+
+    `diagnostics`, when True, additionally computes and returns (as a 4th tuple element, a dict)
+    step 3's Gram-matrix condition number, the rank-r reconstruction residual of `m`, and each
+    client's raw-A overlap with the new shared basis -- collapse-investigation instrumentation,
+    off by default so normal runs pay none of this cost."""
     is_dora_layer = m_list is not None
 
     # --- Step 1: reconstruct each client's effective weight, FedAvg them ---
@@ -68,7 +74,26 @@ def aggregate_dora_layer(
     # --- Step 4: new magnitude = row-norm of W_global itself ---
     m_new = torch.linalg.norm(w_global, dim=1) if is_dora_layer else None
 
-    return a_new, b_new, m_new
+    diag = None
+    if diagnostics:
+        # aat is a symmetric PSD (r, r) Gram matrix -- eigvalsh is the appropriate, cheaper
+        # conditioning measure here (vs. a generic SVD-based cond()).
+        eigvals = torch.linalg.eigvalsh(aat).clamp_min(_EPS)
+        aat_cond = float((eigvals.max() / eigvals.min()).item())
+
+        recon = scaling * (b_new @ a_new)
+        m_norm = m.norm().clamp_min(_EPS)
+        residual = float((m - recon).norm().item() / m_norm.item())
+
+        per_client_overlap = [mean_subspace_overlap(a_c, a_new) for a_c in a_list]
+
+        diag = {
+            "aat_cond": aat_cond,
+            "residual": residual,
+            "per_client_overlap": per_client_overlap,
+        }
+
+    return a_new, b_new, m_new, diag
 
 
 class FeDoRA(FedAvg):
@@ -88,6 +113,7 @@ class FeDoRA(FedAvg):
     def __init__(self, *, model, cfg=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._layers: List[_LoraLayerRef] = build_layer_refs(model)
+        self._debug_diagnostics: bool = bool((cfg or {}).get("debug_diagnostics", False))
 
         if not any(layer.idx_m is not None for layer in self._layers):
             raise ValueError(
@@ -114,12 +140,16 @@ class FeDoRA(FedAvg):
             parameters_to_ndarrays(fit_res.parameters) for _, fit_res in results
         ]
         num_examples: List[int] = [fit_res.num_examples for _, fit_res in results]
+        client_ids: List[str] = [proxy.cid for proxy, _ in results]
 
         aggregated: NDArrays = [None] * len(client_arrays[0])
         layer_overlaps: List[float] = []
         layer_overlaps_min: List[float] = []
+        layer_aat_cond: List[float] = []
+        layer_residual: List[float] = []
+        layer_per_client_overlap: List[List[float]] = []
         for layer in self._layers:
-            a_new, b_new, m_new, overlap_mean, overlap_min = self._aggregate_layer(
+            a_new, b_new, m_new, overlap_mean, overlap_min, diag = self._aggregate_layer(
                 layer, client_arrays, num_examples
             )
             aggregated[layer.idx_a] = a_new
@@ -128,6 +158,10 @@ class FeDoRA(FedAvg):
                 aggregated[layer.idx_m] = m_new
             layer_overlaps.append(overlap_mean)
             layer_overlaps_min.append(overlap_min)
+            if diag is not None:
+                layer_aat_cond.append(diag["aat_cond"])
+                layer_residual.append(diag["residual"])
+                layer_per_client_overlap.append(diag["per_client_overlap"])
 
         # Any index not covered by an indexed LoRA/DoRA layer is a non-LoRA trainable param
         # PEFT still returns from get_peft_model_state_dict -- e.g. glue-nlu's classifier head,
@@ -171,6 +205,31 @@ class FeDoRA(FedAvg):
             metrics_aggregated["fedora_basis_misalign_deg_mean"] = overlap_to_misalign_deg(overlap_mean_all)
             metrics_aggregated["fedora_basis_misalign_deg_max"] = overlap_to_misalign_deg(overlap_min_all)
 
+        # Opt-in collapse-investigation diagnostics (strategy.fedora.debug-diagnostics=true) --
+        # off by default since per-client breakdowns would otherwise need to be recomputed and
+        # logged on every production run for no benefit. `aat_cond` tests (and is expected to
+        # rule out) step 3's closed-form solve being numerically ill-conditioned; `residual` tests
+        # whether the SVD-derived shared basis fails to capture the true aggregated weight delta
+        # `m` in a given round; `client_overlap_mean/_min` are per-client (not cross-client-mean)
+        # so a single outlier client distorting the unweighted SVD stack (step 2 doesn't weight by
+        # `freqs` the way step 1's FedAvg does) becomes visible instead of averaged away into
+        # ~148 healthy layers times 2 healthy clients.
+        if self._debug_diagnostics and layer_aat_cond:
+            metrics_aggregated["fedora_aat_cond_mean"] = float(np.mean(layer_aat_cond))
+            metrics_aggregated["fedora_aat_cond_max"] = float(np.max(layer_aat_cond))
+            metrics_aggregated["fedora_residual_mean"] = float(np.mean(layer_residual))
+            metrics_aggregated["fedora_residual_max"] = float(np.max(layer_residual))
+
+            per_client_arr = np.array(layer_per_client_overlap)  # (num_layers, num_clients)
+            client_overlap_mean = per_client_arr.mean(axis=0)
+            client_overlap_min = per_client_arr.min(axis=0)
+            metrics_aggregated["fedora_client_overlap_mean"] = {
+                cid: float(v) for cid, v in zip(client_ids, client_overlap_mean)
+            }
+            metrics_aggregated["fedora_client_overlap_min"] = {
+                cid: float(v) for cid, v in zip(client_ids, client_overlap_min)
+            }
+
         return parameters_aggregated, metrics_aggregated
 
     def _aggregate_layer(
@@ -178,7 +237,7 @@ class FeDoRA(FedAvg):
         layer: _LoraLayerRef,
         client_arrays: List[NDArrays],
         num_examples: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float, float]:
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float, float, Optional[dict]]:
         total = sum(num_examples)
         freqs = [n / total for n in num_examples]
 
@@ -194,8 +253,9 @@ class FeDoRA(FedAvg):
             else None
         )
 
-        a_new, b_new, m_new = aggregate_dora_layer(
+        a_new, b_new, m_new, diag = aggregate_dora_layer(
             layer.W0, layer.scaling, layer.r, a_list, b_list, m_list, freqs,
+            diagnostics=self._debug_diagnostics,
         )
         client_overlaps = [mean_subspace_overlap(a_c, a_new) for a_c in a_list]
         overlap_mean = float(np.mean(client_overlaps))
@@ -203,4 +263,4 @@ class FeDoRA(FedAvg):
         a_out = a_new.numpy().astype(dtype_a, copy=False)
         b_out = b_new.numpy().astype(dtype_b, copy=False)
         m_out = m_new.numpy().astype(dtype_m, copy=False) if m_new is not None else None
-        return a_out, b_out, m_out, overlap_mean, overlap_min
+        return a_out, b_out, m_out, overlap_mean, overlap_min, diag
