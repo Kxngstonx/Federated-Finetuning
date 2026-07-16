@@ -138,6 +138,14 @@ def server_fn(context: Context):
         },
     )
 
+    # `cfg.seed` would otherwise only seed the data partitioner -- get_model()'s
+    # get_peft_model(...) randomly initializes LoRA A (B is zero-init'd by PEFT) from whatever
+    # global torch RNG state happens to exist at process start, which otherwise differs every run
+    # even with an identical `seed`. Only the server-side init matters: every client immediately
+    # overwrites its own local model via set_parameters() from these same broadcast
+    # initial_parameters, so client-side construction is never actually observed. Matches the
+    # identical fix in apps/glue-nlu/src/glue_nlu/server_app.py.
+    torch.manual_seed(cfg.get("seed", 0))
     init_model = get_model(cfg.model)
     init_model_parameters = ndarrays_to_parameters(get_parameters(init_model))
 

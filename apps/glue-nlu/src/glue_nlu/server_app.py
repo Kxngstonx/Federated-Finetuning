@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 
 import numpy as np
+import torch
 from flwr.common import Context, ndarrays_to_parameters
 from flwr.common.config import unflatten_dict
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
@@ -168,6 +169,15 @@ def server_fn(context: Context):
     )
 
     tokenizer = get_tokenizer(cfg.model.name)
+    # `cfg.seed` otherwise only seeds the Dirichlet data partitioner (see glue_nlu/dataset.py's
+    # load_data) -- the classifier head's and LoRA A's random initialization inside get_model()
+    # draw from whatever global torch RNG state happens to exist at process start, which
+    # otherwise differs every run even with an identical `seed`. LoRA B is already zero-init'd by
+    # PEFT and DoRA's magnitude vector is deterministically derived from W0, so this is the only
+    # remaining source of run-to-run initialization randomness. Only the server-side init matters:
+    # every client immediately overwrites its own local model via set_parameters() from these same
+    # broadcast initial_parameters, so client-side construction is never actually observed.
+    torch.manual_seed(cfg.get("seed", 0))
     init_model = get_model(cfg.model, task_name, aggregation)
     if resume_path:
         set_parameters(init_model, load_checkpoint_parameters(resume_path, init_model))

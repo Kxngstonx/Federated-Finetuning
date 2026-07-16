@@ -34,6 +34,7 @@ def aggregate_dora_layer(
     m_list: Optional[List[torch.Tensor]],  # each (out_features,) float32, or None
     freqs: List[float],  # per-client weight, sums to 1.0
     diagnostics: bool = False,
+    prev_a: Optional[torch.Tensor] = None,  # last round's a_new, i.e. what clients trained from
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
     """Pure-tensor implementation of the 4-step DoRA-aware layer aggregation. All
     inputs/outputs are float32 CPU tensors; numpy/dtype conversion happens in the caller.
@@ -43,9 +44,9 @@ def aggregate_dora_layer(
 
     `diagnostics`, when True, additionally computes and returns (as a 4th tuple element, a dict)
     step 3's Gram-matrix condition number, a row-wise direction-cosine check of the rank-r
-    reconstruction against the true aggregated weight, and each client's raw-A overlap with the
-    new shared basis -- collapse-investigation instrumentation, off by default so normal runs pay
-    none of this cost."""
+    reconstruction against the true aggregated weight, each client's raw-A overlap with the new
+    shared basis, and (if `prev_a` is given) each client's local drift -- collapse-investigation
+    instrumentation, off by default so normal runs pay none of this cost."""
     is_dora_layer = m_list is not None
 
     # --- Step 1: reconstruct each client's effective weight, FedAvg them ---
@@ -61,8 +62,16 @@ def aggregate_dora_layer(
             w_c = v_c
         w_global = w_global + freq * w_c
 
-    # --- Step 2: shared direction basis via SVD of stacked A's ---
-    a_stack = torch.cat(a_list, dim=0)  # (n_clients * r, in_features)
+    # --- Step 2: shared direction basis via (freq-weighted) SVD of stacked A's ---
+    # Weighted analogue of PCA: scaling each client's rows by sqrt(freq_i) before SVD makes the
+    # resulting right-singular-vectors the basis that best explains the freq-weighted variance of
+    # the client A's, instead of treating every client (regardless of data size) as an equal
+    # contributor -- matching step 1's FedAvg, which already weights by freq. Row-scaling doesn't
+    # change a_new's orthonormality (still SVD right-singular-vectors of *some* matrix), only which
+    # directions dominate it.
+    a_stack = torch.cat(
+        [freq**0.5 * a_c for freq, a_c in zip(freqs, a_list)], dim=0
+    )  # (n_clients * r, in_features)
     _, s, vh = torch.linalg.svd(a_stack, full_matrices=False)
     actual_r = min(r, s.shape[0])  # always == r here; see note in plan
     a_new = vh[:actual_r, :]
@@ -112,6 +121,16 @@ def aggregate_dora_layer(
             "per_client_overlap": per_client_overlap,
         }
 
+        # Client-side signal: how far each client's uploaded local A has already moved from the
+        # basis it actually started this round's local training from (last round's a_new), i.e.
+        # entirely before this round's server-side SVD stack (step 2 above) ever sees it. Distinct
+        # from `per_client_overlap`, which compares against *this* round's freshly-recomputed
+        # a_new -- an aggregation-side quantity. Omitted (not just zero-filled) on round 1 / a
+        # freshly-started resumed run's first round, where there is no previous basis to compare
+        # against.
+        if prev_a is not None:
+            diag["local_drift"] = [mean_subspace_overlap(a_c, prev_a) for a_c in a_list]
+
     return a_new, b_new, m_new, diag
 
 
@@ -133,6 +152,10 @@ class FeDoRA(FedAvg):
         super().__init__(**kwargs)
         self._layers: List[_LoraLayerRef] = build_layer_refs(model)
         self._debug_diagnostics: bool = bool((cfg or {}).get("debug_diagnostics", False))
+        # Previous round's a_new per layer (keyed by layer name), i.e. the basis each client
+        # actually started this round's local training from -- only maintained when diagnostics
+        # are on, purely to feed the `local_drift` diagnostic below.
+        self._prev_a: dict = {}
 
         if not any(layer.idx_m is not None for layer in self._layers):
             raise ValueError(
@@ -168,6 +191,7 @@ class FeDoRA(FedAvg):
         layer_direction_cosine: List[float] = []
         layer_direction_cosine_min: List[float] = []
         layer_per_client_overlap: List[List[float]] = []
+        layer_local_drift: List[List[float]] = []
         for layer in self._layers:
             a_new, b_new, m_new, overlap_mean, overlap_min, diag = self._aggregate_layer(
                 layer, client_arrays, num_examples
@@ -183,6 +207,8 @@ class FeDoRA(FedAvg):
                 layer_direction_cosine.append(diag["direction_cosine_mean"])
                 layer_direction_cosine_min.append(diag["direction_cosine_min"])
                 layer_per_client_overlap.append(diag["per_client_overlap"])
+                if "local_drift" in diag:
+                    layer_local_drift.append(diag["local_drift"])
 
         # Any index not covered by an indexed LoRA/DoRA layer is a non-LoRA trainable param
         # PEFT still returns from get_peft_model_state_dict -- e.g. glue-nlu's classifier head,
@@ -258,6 +284,28 @@ class FeDoRA(FedAvg):
                 cid: float(v) for cid, v in zip(client_ids, client_overlap_min)
             }
 
+            # Client-side signals (see aggregate_dora_layer's `local_drift` comment): local_drift
+            # is absent on round 1 (no previous basis yet), present for every layer from round 2
+            # onward, so `layer_local_drift` is either empty or fully populated here, never
+            # partial. `client_train_loss` is the raw per-client value each client already
+            # computes and reports (glue_nlu/client_app.py's fit()), otherwise only ever exposed
+            # server-side as a data-weighted mean via fit_metrics_aggregation_fn -- logged here
+            # unweighted-and-per-client so a single client's anomalous round is visible instead of
+            # averaged into the fleet.
+            if layer_local_drift:
+                local_drift_arr = np.array(layer_local_drift)  # (num_layers, num_clients)
+                local_drift_mean = local_drift_arr.mean(axis=0)
+                local_drift_min = local_drift_arr.min(axis=0)
+                metrics_aggregated["fedora_client_local_drift_mean"] = {
+                    cid: float(v) for cid, v in zip(client_ids, local_drift_mean)
+                }
+                metrics_aggregated["fedora_client_local_drift_min"] = {
+                    cid: float(v) for cid, v in zip(client_ids, local_drift_min)
+                }
+            metrics_aggregated["fedora_client_train_loss"] = {
+                cid: res.metrics.get("train_loss") for cid, (_, res) in zip(client_ids, results)
+            }
+
         return parameters_aggregated, metrics_aggregated
 
     def _aggregate_layer(
@@ -284,7 +332,10 @@ class FeDoRA(FedAvg):
         a_new, b_new, m_new, diag = aggregate_dora_layer(
             layer.W0, layer.scaling, layer.r, a_list, b_list, m_list, freqs,
             diagnostics=self._debug_diagnostics,
+            prev_a=self._prev_a.get(layer.name),
         )
+        if self._debug_diagnostics:
+            self._prev_a[layer.name] = a_new.clone()
         client_overlaps = [mean_subspace_overlap(a_c, a_new) for a_c in a_list]
         overlap_mean = float(np.mean(client_overlaps))
         overlap_min = float(np.min(client_overlaps))
