@@ -136,17 +136,27 @@ def rotation_align_optimization(
     align_matrix: str,
     updated_a: torch.Tensor,
     updated_b: torch.Tensor,
+    rotation_lambda: float = 1.5,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Solve the Orthogonal Procrustes problem aligning (updated_a, updated_b) to `ref`
     (the client's own previous-round global A or B), and apply the resulting rotation to both
-    factors. Preserves the product `updated_b @ updated_a` exactly.
+    factors.
 
     align_matrix: 'A' or 'B' -- which of the two just-trained factors is compared against `ref`
     to solve for the rotation (the other factor is rotated by the same R for consistency).
 
+    rotation_lambda: matches FedRot-LoRA/rotation_alignment_tools.py's hard/soft split
+    (client.py: `if rotate_lambda > 1.0`). >1.0 (default, matching the source repo's own
+    cfg_llm.py default) applies the raw Procrustes rotation R and preserves the product
+    `updated_b @ updated_a` exactly. <=1.0 linearly interpolates toward identity
+    (`(1 - lambda) * I + lambda * R`), re-orthogonalizes the result via its own SVD, and applies
+    that instead -- this softened rotation no longer exactly preserves updated_b @ updated_a,
+    which is inherent to the source repo's soft-rotation design, not a bug here.
+
     Includes a determinant-flip guard (absent in the source repo's hard-rotation path, present
     only in its soft-rotation variant) to avoid applying a reflection instead of a proper
-    rotation when the raw SVD solution has det(U @ Vh) < 0.
+    rotation when the raw SVD solution has det(U @ Vh) < 0. We apply it unconditionally (both
+    hard and soft paths), unlike the source repo which only guards the soft path.
     """
     a_dtype, b_dtype = updated_a.dtype, updated_b.dtype
 
@@ -165,6 +175,15 @@ def rotation_align_optimization(
             vh = vh.clone()
             vh[-1, :] *= -1
             r = torch.matmul(u, vh)
+
+        if rotation_lambda <= 1.0:
+            identity = torch.eye(r.shape[0], device=r.device, dtype=r.dtype)
+            r_soft = (1 - rotation_lambda) * identity + rotation_lambda * r
+            try:
+                u_s, _, vh_s = torch.linalg.svd(r_soft, full_matrices=False)
+                r = torch.matmul(u_s, vh_s)
+            except torch.linalg.LinAlgError:
+                pass  # fall back to the hard rotation `r` computed above
 
         rotated_b = torch.matmul(updated_b, r.to(b_dtype))
         rotated_a = torch.matmul(r.T.to(a_dtype), updated_a)

@@ -164,6 +164,7 @@ class FlowerClient(NumPyClient):
 
         initial_share = fedrot_cfg.get("initial_share", "A")
         swap_offset = 0 if initial_share == "A" else 1
+        rotation_lambda = fedrot_cfg.get("rotate_lambda", 1.5)
 
         layers = index_lora_layers(self.model)
         trained = list(trained)
@@ -176,7 +177,9 @@ class FlowerClient(NumPyClient):
             b_t = torch.from_numpy(np.asarray(trained[layer.idx_b]))
             ref_t = torch.from_numpy(np.asarray(ref))
 
-            a_new, b_new = rotation_align_optimization(ref_t, align_matrix, a_t, b_t)
+            a_new, b_new = rotation_align_optimization(
+                ref_t, align_matrix, a_t, b_t, rotation_lambda=rotation_lambda
+            )
             trained[layer.idx_a] = a_new.numpy()
             trained[layer.idx_b] = b_new.numpy()
         return trained

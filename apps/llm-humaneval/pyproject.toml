@@ -80,6 +80,7 @@ strategy.fedsvd.svd-warmup-steps = 0
 strategy.flora.merge-into-base = true
 strategy.fedrot.rotate = true
 strategy.fedrot.initial-share = "A"
+strategy.fedrot.rotate-lambda = 1.5
 federate.client-num = 6
 num-server-rounds = 100
 seed = 13
